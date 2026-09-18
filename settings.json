@@ -1,0 +1,17 @@
+{
+  "homing": {
+    "speed_fast": 50,
+    "speed_slow": 10,
+    "timeout": 200,
+    "offset_mm": -2.5
+  },
+  "laser": {
+    "pulse_ms": 300
+  },
+  "absolute_position": {
+    "reference_established": true
+  },
+  "appearance": {
+    "theme": "light"
+  }
+}

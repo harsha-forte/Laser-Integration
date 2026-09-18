@@ -1,0 +1,22 @@
+{
+  "name": "Part2",
+  "sides": 4,
+  "positions": [
+    {
+      "mm": 102.0,
+      "label": "Side 1"
+    },
+    {
+      "mm": 108.0,
+      "label": "Side 2"
+    },
+    {
+      "mm": 115.0,
+      "label": "Side 3"
+    },
+    {
+      "mm": 116.0,
+      "label": "Side 4"
+    }
+  ]
+}
