@@ -18,8 +18,13 @@ Drive layer (per axis)
   - one motion lock per axis: jog / homing / move on the same axis cannot interleave
   - machine reference only trusted across power cycles when C00.07 = absolute mode
 
-Manual / Automatic programs are DISABLED (PROGRAMS_ENABLED = False) until the
-two-axis program logic is defined. The code is kept but cannot be started.
+Manual laser program (two axes):
+  START  -> transfer to loading position, laser to side 1 height
+  MARK / foot pedal -> transfer to laser position, verify, pulse GPIO17
+  OUT4   -> laser to the next side height, verify, pulse again
+  OUT5   -> delay, then back to the loading position
+Every program move goes through the group collision rule.
+The Automatic cycle is still disabled (AUTO_ENABLED = False).
 """
 
 import time
@@ -44,7 +49,13 @@ except (ImportError, RuntimeError):
 BAUD_RATE      = 115200
 DRIVE_ADDR     = 0x01          # both drives: address 1, each on its own USB port
 
-PROGRAMS_ENABLED = False       # Manual / Auto locked until program logic is defined
+MANUAL_ENABLED   = True        # Manual laser program (two axes)
+AUTO_ENABLED     = False       # Automatic cycle - not redesigned for two axes yet
+POS_VERIFY_TOL_MM = 0.05       # both axes must be this close before the laser fires
+SIGNAL_DEBOUNCE_S = 0.020      # an input must be stable this long before it counts
+SIGNAL_LOCKOUT_S  = 0.400      # ignore further edges of the same signal for this long
+SPEED_STOPPED_RPM = 5          # |U40.01| below this counts as standing still
+VERIFY_RETRY_S    = 2.0        # keep re-checking this long before failing
 
 # Per-axis configuration. Units: command units/mm = C00.02 / lead.
 AXIS_CONFIG = {
@@ -83,8 +94,10 @@ AXES = tuple(AXIS_CONFIG)      # ("transfer", "laser")
 SERIAL_PORT          = AXIS_CONFIG["transfer"]["port"]
 MAX_TRAVEL_MM        = AXIS_CONFIG["transfer"]["max_travel_mm"]
 HOME_SIDE            = AXIS_CONFIG["transfer"]["home_side"]
-PART_HEIGHT_MIN_MM   = 60.0
-PART_HEIGHT_MAX_MM   = MAX_TRAVEL_MM
+# Laser-axis heights used by part recipes. The minimum is the collision rule's
+# laser minimum: with the transfer axis under the laser the head must stay above it.
+PART_HEIGHT_MIN_MM   = 200.0
+PART_HEIGHT_MAX_MM   = AXIS_CONFIG["laser"]["max_travel_mm"]
 
 PARTS_DIR      = "parts"
 SETTINGS_FILE  = "settings.json"
@@ -112,6 +125,17 @@ DEFAULT_SETTINGS = {
     },
     # Saved machine reference per axis. Only trusted at startup when the drive
     # is in absolute mode (C00.07 != 0) AND the reference was made in that mode.
+    # Manual laser program
+    "program": {
+        "loading_mm":        0.0,     # transfer position for loading / unloading
+        "laser_mm":          350.0,   # transfer position under the laser
+        "out5_delay_s":      1.0,     # pause after OUT5 before returning
+        "result_timeout_s":  120,     # max wait for OUT4/OUT5
+        "complete_timeout_s": 15,     # max wait for OUT5 after the last side's OUT4
+        "transfer_speed_rpm": 300,
+        "laser_speed_rpm":    300,
+        "speed_override_pct": 100,    # scales both program speeds (10-100 %)
+    },
     "reference_transfer": {"established": False, "abs_mode": False},
     "reference_laser":    {"established": False, "abs_mode": False},
     # Group collision rule: while the transfer axis is above transfer_limit_mm,
@@ -139,6 +163,7 @@ class State:
     READY_TO_MARK    = "READY_TO_MARK"
     PROGRAM_STOPPED  = "PROGRAM_STOPPED"
     RESETTING        = "RESETTING"
+    RETURNING_INITIAL = "RETURNING_INITIAL"
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -724,11 +749,11 @@ class PartManager:
                 mm = float(p.get("mm"))
             except (TypeError, ValueError):
                 return False, f"Position for side {idx} is invalid"
-            if not (PART_HEIGHT_MIN_MM <= mm <= PART_HEIGHT_MAX_MM):
-                return False, (
-                    f"Side {idx} position {mm}mm is out of range "
-                    f"[{PART_HEIGHT_MIN_MM:g}-{PART_HEIGHT_MAX_MM:g} mm]"
-                )
+            if mm < PART_HEIGHT_MIN_MM:
+                return False, (f"Side {idx}: part height must be above {PART_HEIGHT_MIN_MM:g} mm "
+                               f"(collision rule) - {mm:g} mm entered")
+            if mm > PART_HEIGHT_MAX_MM:
+                return False, f"Side {idx}: part height must be at most {PART_HEIGHT_MAX_MM:g} mm"
         return True, "Valid"
 
     def save(self, data):
@@ -832,12 +857,15 @@ class LaserController:
         self.manual_side_index         = 0       # 0-based side currently marking / next initial side
         self.manual_out4_count         = 0       # intermediate-finish pulses in current part
         self.manual_parts_completed    = 0
-        self.manual_pending_next_index = None
-        self.manual_pending_return     = False
+        self.manual_pending            = None    # step to continue after Resume
+        self.manual_trigger_source     = None
+        self.manual_result_deadline    = 0.0
+        self.manual_awaiting_complete  = False   # last side done, OUT5 must follow
         self.manual_program_state      = "NO_PART"
         self.manual_error              = None
         self._manual_motion_stop       = False
         self._manual_operation_lock    = threading.Lock()
+        self.signal_counts             = {"OUT4": 0, "OUT5": 0}
         self._gpio_monitor_stop        = False
         self._gpio_monitor_thread      = None
 
@@ -918,7 +946,11 @@ class LaserController:
         return {
             "state": self.state,
             "mode": self.mode,
-            "programs_enabled": PROGRAMS_ENABLED,
+            "manual_enabled": MANUAL_ENABLED,
+            "auto_enabled": AUTO_ENABLED,
+            "programs_enabled": MANUAL_ENABLED,
+            "program_config": self.program_config(),
+            "manual_pending": str(self.manual_pending) if self.manual_pending else None,
             "axes": axes,
             "homing_suggested": [axes[k]["name"] for k in AXES if axes[k]["homing_required"]],
             "collision": self._collision_status(),
@@ -947,11 +979,13 @@ class LaserController:
             "manual_mark_enabled": self.manual_mark_enabled,
             "manual_initial_ready": self.manual_initial_ready,
             "manual_awaiting_result": self.manual_awaiting_result,
+            "manual_awaiting_complete": self.manual_awaiting_complete,
             "manual_side_index": self.manual_side_index,
             "manual_side_number": self.manual_side_index + 1 if part else 0,
             "manual_total_sides": int(part.get("sides", 0)) if part else 0,
             "manual_out4_count": self.manual_out4_count,
             "manual_parts_completed": self.manual_parts_completed,
+            "signal_counts": dict(self.signal_counts),
             "manual_error": self.manual_error,
         }
 
@@ -1121,6 +1155,9 @@ class LaserController:
         a["jog_enabled"] = False
         a["position"] = a["raw"] = a["speed"] = None
         a["error"] = "Drive connection lost"
+        if self.manual_program_started and self.manual_program_state != "ERROR":
+            threading.Thread(target=self._manual_fault, daemon=True,
+                             args=(f"{AXIS_CONFIG[axis]['name']} drive connection lost",)).start()
         a["_next_connect"] = time.monotonic() + 2.0
         self.axis_log(axis, "CONNECTION LOST - reference cleared, homing required after reconnect")
 
@@ -1146,8 +1183,8 @@ class LaserController:
                  + (f" | NOT connected: {', '.join(missing)}" if missing else ""))
         if need:
             self.log(f"Homing suggested for: {', '.join(need)}")
-        if not PROGRAMS_ENABLED:
-            self.log("Manual / Automatic programs are disabled in this version")
+        if not AUTO_ENABLED:
+            self.log("Automatic cycle is disabled in this version - Manual program is available")
         self.set_state(State.READY if online else State.ERROR)
         self._start_telemetry()
         self._start_gpio_monitor()
@@ -1227,39 +1264,75 @@ class LaserController:
         self._gpio_monitor_thread.start()
 
     def _gpio_monitor_loop(self):
-        prev_pedal = self.gpio.foot_pedal()
-        prev_out4 = self.gpio.intermediate_finish()
-        prev_out5 = self.gpio.part_complete()
-        last_pedal_edge = 0.0
+        """Polls the EzCad2 outputs with debouncing. A line must be stable for
+        SIGNAL_DEBOUNCE_S before an edge counts, and further edges of the same
+        signal are ignored for SIGNAL_LOCKOUT_S - contact bounce on a 1 s pulse
+        would otherwise be counted as a second OUT4/OUT5."""
+        readers = {"OUT4": self.gpio.intermediate_finish,
+                   "OUT5": self.gpio.part_complete,
+                   "PEDAL": self.gpio.foot_pedal}
+        stable = {k: fn() for k, fn in readers.items()}     # debounced level
+        raw_prev = dict(stable)
+        changed_at = {k: 0.0 for k in readers}
+        rise_at = {k: 0.0 for k in readers}
+        accepted_at = {k: 0.0 for k in readers}
+
         while not self._gpio_monitor_stop:
             try:
-                pedal = self.gpio.foot_pedal()
-                out4 = self.gpio.intermediate_finish()
-                out5 = self.gpio.part_complete()
                 now = time.monotonic()
+                for name, read in readers.items():
+                    raw = read()
+                    if raw != raw_prev[name]:
+                        raw_prev[name] = raw
+                        changed_at[name] = now
+                        continue
+                    if raw == stable[name] or now - changed_at[name] < SIGNAL_DEBOUNCE_S:
+                        continue
 
-                if pedal and not prev_pedal and now - last_pedal_edge > 0.15:
-                    last_pedal_edge = now
-                    self._on_foot_pedal()
-                if out4 and not prev_out4:
-                    self._on_out4()
-                if out5 and not prev_out5:
-                    self._on_out5()
+                    stable[name] = raw                       # debounced edge
+                    if raw:
+                        if now - accepted_at[name] < SIGNAL_LOCKOUT_S:
+                            self.log(f"SIGNAL {name} edge ignored - bounce within "
+                                     f"{SIGNAL_LOCKOUT_S * 1000:.0f} ms of the previous pulse")
+                            continue
+                        accepted_at[name] = now
+                        rise_at[name] = now
+                        if name == "PEDAL":
+                            self._on_foot_pedal()
+                        else:
+                            self.signal_counts[name] += 1
+                            self.log(f"SIGNAL {name} #{self.signal_counts[name]} - "
+                                     f"side {self.manual_side_index + 1}, "
+                                     f"awaiting={self.manual_awaiting_result}"
+                                     + (", awaiting OUT5" if self.manual_awaiting_complete else ""))
+                            (self._on_out4 if name == "OUT4" else self._on_out5)()
+                    elif rise_at[name]:
+                        width = (now - rise_at[name]) * 1000.0
+                        rise_at[name] = 0.0
+                        self.log(f"SIGNAL {name} low again after {width:.0f} ms")
+                        if width < 100:
+                            self.log(f"WARNING: {name} pulse is only {width:.0f} ms - "
+                                     f"100 ms or more is safer")
 
-                prev_pedal, prev_out4, prev_out5 = pedal, out4, out5
+                self._check_result_timeout()
             except Exception as exc:
                 self.log(f"GPIO monitor error: {exc}")
-            time.sleep(0.02)
+            time.sleep(0.005)
 
     def _on_foot_pedal(self):
-        # Pedal is a valid Mark action ONLY when the manual program is armed at
-        # side-1 initial position.  It already starts EzCad2 electrically, so
-        # this path must NOT pulse GPIO17 again.
-        if not self.manual_mark_enabled or not self.manual_initial_ready:
-            self.log("Foot pedal ignored - Laser Program is not ready at initial position")
+        """The pedal is wired to EzCad2 (first trigger) and to GPIO22 (this input).
+        It is only a valid MARK when the cell is ready at the loading position."""
+        if self.manual_program_state == "READY_TO_MARK" and self.manual_mark_enabled:
+            self.log("Foot pedal detected on GPIO22")
+            self.manual_mark(source="pedal")
             return
-        self.log("Foot pedal detected on GPIO22 - treating as MARK (no GPIO17 pulse)")
-        self.manual_mark(source="pedal")
+        if self.manual_program_started:
+            self._manual_fault(
+                "Foot pedal pressed out of sequence - EzCad2 has received an extra trigger. "
+                "Stop and restart the EzCad2 program, then RESET here.")
+            return
+        self.log("Foot pedal ignored - no Laser Program is ready. "
+                 "EzCad2 may now be armed: make sure its program is restarted before starting.")
 
     # ── Part selection / validation ─────────────────────────────────────────
 
@@ -1269,7 +1342,8 @@ class LaserController:
         # Do not let a dropdown change disturb an active side/motion.
         if (part_name != (self.manual_selected_part_name or "") and
                 (self.manual_awaiting_result or self.manual_program_state in {
-                    "INITIALIZING", "MOVING_NEXT", "RETURNING_INITIAL", "RESETTING"
+                    "MOVING_TO_LOAD", "MOVING_TO_LASER", "MOVING_NEXT_SIDE",
+                    "RETURNING_LOAD", "RESETTING"
                 })):
             return False, "Cannot change part while the manual cycle is active"
 
@@ -1298,8 +1372,7 @@ class LaserController:
             self.manual_stopped = False
             self.manual_side_index = 0
             self.manual_out4_count = 0
-            self.manual_pending_next_index = None
-            self.manual_pending_return = False
+            self.manual_pending = None
             self.manual_program_state = "PART_SELECTED"
             self.manual_error = None
             self.state = State.PROGRAM_SELECTED
@@ -1316,392 +1389,469 @@ class LaserController:
         self.manual_awaiting_result = False
         self.manual_side_index = 0
         self.manual_out4_count = 0
-        self.manual_pending_next_index = None
-        self.manual_pending_return = False
+        self.manual_pending = None
         self.manual_program_state = program_state
         self.manual_error = None
 
-    # ── Manual Laser Program Start / Mark ──────────────────────────────────
+    # ── Manual Laser Program (two axes) ─────────────────────────────────────
+    #
+    # Cycle:
+    #   START            transfer -> loading position, laser -> side 1 height
+    #   READY_TO_MARK    operator loads the part, presses MARK or the pedal
+    #                    (MARK sends the EzCad2 arming pulse; the pedal is
+    #                     wired to EzCad2 and arms it itself)
+    #   MOVING_TO_LASER  transfer -> laser position (collision rule applies)
+    #                    positions verified, then GPIO17 fires the mark pulse
+    #   WAITING_RESULT   EzCad2 OUT4 -> laser to next side height, pulse again
+    #                    EzCad2 OUT5 -> delay, then back to the loading position
+
+    def program_config(self):
+        p = self.settings.get_section("program")
+        return {
+            "loading_mm":      float(p.get("loading_mm", 0.0)),
+            "laser_mm":        float(p.get("laser_mm", 350.0)),
+            "out5_delay_s":    float(p.get("out5_delay_s", 1.0)),
+            "result_timeout_s": float(p.get("result_timeout_s", 120)),
+            "complete_timeout_s": float(p.get("complete_timeout_s", 15)),
+            "transfer_rpm":    int(p.get("transfer_speed_rpm", 300)),
+            "laser_rpm":       int(p.get("laser_speed_rpm", 300)),
+            "override_pct":    int(p.get("speed_override_pct", 100)),
+        }
+
+    def _prog_stop_requested(self):
+        return self._manual_motion_stop or self.manual_stopped
+
+    def _prog_move(self, axis, target_mm, speed_rpm, what):
+        """Program move. Returns 'ok' | 'stopped' | 'failed'.
+        The speed override scales every program move; jog and homing are not affected."""
+        pct = max(1, min(100, self.program_config()["override_pct"]))
+        speed_rpm = max(1, int(round(speed_rpm * pct / 100.0)))
+        self.set_state(State.MOVING_Z)
+        self.log(f"{what}: {AXIS_CONFIG[axis]['name']} -> {target_mm:.3f} mm "
+                 f"at {speed_rpm} rpm" + (f" ({pct} % override)" if pct != 100 else ""))
+        ok = self.move_axis(axis, target_mm, speed_rpm,
+                            stop_flag=self._prog_stop_requested, log_cb=self.log)
+        if ok:
+            return "ok"
+        return "stopped" if self._prog_stop_requested() else "failed"
+
+    def _verify_positions(self, transfer_mm, laser_mm):
+        """Before the laser fires, both axes must be: servo OFF (U41.0A = 1, so the
+        drive cannot be executing anything), standing still, and within tolerance
+        of the expected position. Retried for VERIFY_RETRY_S."""
+        deadline = time.time() + VERIFY_RETRY_S
+        while True:
+            why = None
+            for axis, want in (("transfer", transfer_mm), ("laser", laser_mm)):
+                d = self.drives[axis]
+                name = AXIS_CONFIG[axis]["name"]
+                if not d.online():
+                    return False, f"{name} drive is not connected"
+                st = d.get_state()                 # 0 not ready, 1 ready (servo off), 2 running, 3 fault
+                pos = d.get_position_mm()
+                spd = d.get_speed()
+                if pos is None or spd is None or st is None:
+                    why = f"{name}: could not read the drive"
+                elif st == 3:
+                    return False, f"{name} drive is in FAULT"
+                elif st == 2:
+                    why = f"{name} servo is still ON"
+                elif abs(spd) > SPEED_STOPPED_RPM:
+                    why = f"{name} is still moving ({spd} rpm)"
+                elif abs(pos - want) > POS_VERIFY_TOL_MM:
+                    why = (f"{name} is at {pos:.3f} mm, expected {want:.3f} mm "
+                           f"(tolerance {POS_VERIFY_TOL_MM:g} mm)")
+                if why:
+                    break
+            if why is None:
+                return True, None
+            if time.time() >= deadline or self._prog_stop_requested():
+                return False, why
+            time.sleep(0.1)
+
+    def _fire_laser(self, side_index, transfer_mm, laser_mm):
+        """Verify both axes, pulse GPIO17 and start waiting for OUT4/OUT5."""
+        for axis in AXES:                      # no servo may be energised while marking
+            self.drives[axis].servo_off()
+        ok, why = self._verify_positions(transfer_mm, laser_mm)
+        if not ok:
+            self._manual_fault(f"Laser pulse blocked - {why}")
+            return False
+        pulse_ms = self.settings.get("laser", "pulse_ms") or 100
+        self.manual_side_index = side_index
+        self.current_step = side_index + 1
+        self.manual_awaiting_result = True
+        self.manual_result_deadline = time.monotonic() + self.program_config()["result_timeout_s"]
+        self.manual_program_state = "WAITING_SIDE_RESULT"
+        self.set_state(State.LASER_FIRING)
+        total = int(self.current_part["sides"])
+        self.log(f"Side {side_index + 1}/{total}: GPIO17 pulse {pulse_ms} ms - waiting for OUT4/OUT5")
+        self.gpio.pulse_laser_start(pulse_ms)
+        self.set_state(State.WAITING_LASER)
+        return True
+
+    def _side_mm(self, index):
+        return float(self.current_part["positions"][index]["mm"])
+
+    # ── Start ───────────────────────────────────────────────────────────────
 
     def start_manual_program(self, part_name):
-        if not PROGRAMS_ENABLED:
-            return False, "Manual program is disabled until the two-axis program logic is defined"
-        if not self.position_ready():
-            return False, "Trusted absolute machine position unavailable - home/check drive first"
-        part = self.parts.load(part_name)
+        if not MANUAL_ENABLED:
+            return False, "Manual program is disabled"
+        ok, err = self.select_manual_part(part_name)
+        if not ok:
+            return False, err
+        part = self.parts.load(self.manual_selected_part_name)
         ok, msg = self.parts.validate(part)
         if not ok:
-            self.manual_error = msg
             self.manual_program_state = "CONFIG_ERROR"
+            self.manual_error = msg
             return False, msg
-        if self.manual_awaiting_result:
-            return False, "Laser cycle is already active"
+        for axis in AXES:
+            if not self.drives[axis].online():
+                return False, f"{AXIS_CONFIG[axis]['name']} drive is not connected"
+            if not self.ax[axis]["reference"]:
+                return False, f"{AXIS_CONFIG[axis]['name']} is not homed - home it in Configure"
+            if self.ax[axis]["busy"]:
+                return False, f"{AXIS_CONFIG[axis]['name']} is busy ({self.ax[axis]['busy']})"
+        if self.manual_program_started:
+            return False, "Laser Program is already started"
 
-        self.manual_selected_part_name = part_name
         self.current_part = part
         self.total_steps = int(part["sides"])
-        self.current_step = 0
         self.manual_program_started = True
         self.manual_stopped = False
+        self._manual_motion_stop = False
         self.manual_mark_enabled = False
         self.manual_initial_ready = False
         self.manual_awaiting_result = False
+        self.manual_awaiting_complete = False
         self.manual_side_index = 0
         self.manual_out4_count = 0
-        self.manual_pending_next_index = None
-        self.manual_pending_return = False
-        self.manual_program_state = "INITIALIZING"
+        self.manual_pending = None
         self.manual_error = None
-        self._manual_motion_stop = False
-        self.set_state(State.INITIALIZING)
-        threading.Thread(target=self._move_to_initial, daemon=True).start()
+        for axis in AXES:
+            self.ax[axis]["jog_enabled"] = False
+        self.log(f"=== LASER PROGRAM START - part '{part['name']}', {self.total_steps} side(s) ===")
+        threading.Thread(target=self._go_to_loading, args=(True,), daemon=True).start()
         return True, None
 
-    def _move_to_initial(self):
-        if not self.current_part:
-            return
-        target = float(self.current_part["positions"][0]["mm"])
+    def _go_to_loading(self, first=False):
+        """Transfer to the loading position, then laser to the side 1 height."""
+        cfg = self.program_config()
         with self._manual_operation_lock:
-            if self.manual_stopped:
-                self.manual_program_state = "PROGRAM_STOPPED"
-                return
-            self.manual_program_state = "INITIALIZING"
-            self.set_state(State.MOVING_Z)
-            # move_to skips motion if already in window and energises the axis to hold it
-            self.log(f"Laser Program Start - axis to side 1 initial position {target:.3f} mm")
-            ok = self.move_axis("transfer", 
-                target, 300,
-                stop_flag=lambda: self._manual_motion_stop or self.manual_stopped,
-                log_cb=self.log,
-            )
-            if not ok:
-                if self.manual_stopped or self._manual_motion_stop:
-                    self.manual_program_state = "PROGRAM_STOPPED"
-                    self.set_state(State.PROGRAM_STOPPED)
-                else:
-                    self.manual_error = "Failed to reach initial side position"
-                    self.manual_program_state = "ERROR"
-                    self.set_state(State.ERROR)
-                return
-            self._refresh_absolute_position()
+            if self._prog_stop_requested():
+                return self._park_stopped("to_loading")
+            self.manual_program_state = "MOVING_TO_LOAD"
+            self.manual_mark_enabled = False
+            self.manual_initial_ready = False
+            # Transfer first: moving toward 0 mm always leaves the collision zone,
+            # so the laser can then go to any height.
+            r = self._prog_move("transfer", cfg["loading_mm"], cfg["transfer_rpm"],
+                                "Loading position")
+            if r != "ok":
+                return self._after_move(r, "to_loading", "Failed to move the transfer axis to the loading position")
+            r = self._prog_move("laser", self._side_mm(0), cfg["laser_rpm"], "Side 1 height")
+            if r != "ok":
+                return self._after_move(r, "to_loading", "Failed to move the laser axis to the side 1 height")
+
             self.manual_side_index = 0
             self.current_step = 1
+            self.manual_out4_count = 0
+            self.manual_pending = None
+            self.manual_mark_enabled = True
             self.manual_initial_ready = True
-            self.manual_mark_enabled = not self.manual_stopped
-            if self.manual_stopped:
-                self.manual_program_state = "PROGRAM_STOPPED"
-                self.set_state(State.PROGRAM_STOPPED)
-            else:
-                self.manual_program_state = "READY_TO_MARK"
-                self.set_state(State.READY_TO_MARK)
-                self.log("Initial position reached - MARK button and GPIO22 foot pedal are enabled")
+            self.manual_program_state = "READY_TO_MARK"
+            self.set_state(State.READY)
+            self.log("At loading position - load the part, then press MARK or the foot pedal")
+
+    def _after_move(self, result, pending, fail_msg):
+        if result == "stopped":
+            return self._park_stopped(pending)
+        self._manual_fault(fail_msg)
+
+    def _park_stopped(self, pending):
+        self.manual_pending = pending
+        self.manual_mark_enabled = False
+        self.manual_initial_ready = False
+        self.manual_program_state = "PROGRAM_STOPPED"
+        self.set_state(State.PROGRAM_STOPPED)
+
+    # ── Mark / pedal ────────────────────────────────────────────────────────
 
     def manual_mark(self, source="gui"):
-        if not PROGRAMS_ENABLED:
-            return False, "Manual program is disabled until the two-axis program logic is defined"
+        if not MANUAL_ENABLED:
+            return False, "Manual program is disabled"
         if not self.manual_program_started or not self.current_part:
             return False, "Press Laser Program Start first"
         if self.manual_stopped:
             return False, "Laser Program is stopped - press Resume"
-        if not self.manual_mark_enabled or not self.manual_initial_ready:
-            return False, "MARK is locked until the axis is at the initial side position"
+        if self.manual_program_state != "READY_TO_MARK" or not self.manual_mark_enabled:
+            return False, "MARK is locked until the cell is ready at the loading position"
         if self.manual_awaiting_result:
             return False, "Already waiting for EzCad2 OUT4/OUT5"
 
-        self.manual_mark_enabled = False  # prevent a double-start while marking
-        self.manual_awaiting_result = True
-        self.manual_side_index = 0
-        self.current_step = 1
-        self.manual_out4_count = 0
-        self.manual_program_state = "WAITING_SIDE_RESULT"
-        self.set_state(State.WAITING_LASER)
-
+        self.manual_mark_enabled = False
+        self.manual_initial_ready = False
+        self.manual_trigger_source = source
         if source == "pedal":
-            # IMPORTANT: physical pedal already starts EzCad2. GPIO22 is only
-            # acknowledgement to this program so it starts waiting for OUT4/OUT5.
-            self.log("Side 1 started by foot pedal - awaiting OUT4/OUT5")
+            # The pedal is wired to EzCad2 and has already given it the first
+            # (arming) trigger; the Pi must not repeat it.
+            self.log("Foot pedal accepted - EzCad2 armed by the pedal")
         else:
             pulse_ms = self.settings.get("laser", "pulse_ms") or 100
-            self.log(f"Side 1 started by GUI MARK - GPIO17 pulse {pulse_ms} ms")
-            threading.Thread(target=self.gpio.pulse_laser_start, args=(pulse_ms,), daemon=True).start()
+            self.log(f"MARK accepted - EzCad2 arming pulse on GPIO17 ({pulse_ms} ms)")
+            self.gpio.pulse_laser_start(pulse_ms)
+        threading.Thread(target=self._go_to_laser, daemon=True).start()
         return True, None
 
-    def _trigger_side(self, index):
-        """Move to side index if necessary, then start it via GPIO17."""
-        if not self.current_part:
-            return
-        positions = self.current_part["positions"]
-        if index < 0 or index >= len(positions):
-            self._manual_fault(f"Requested side {index + 1} is outside recipe")
-            return
-
+    def _go_to_laser(self):
+        cfg = self.program_config()
         with self._manual_operation_lock:
-            if self.manual_stopped:
-                self.manual_pending_next_index = index
-                self.manual_program_state = "PROGRAM_STOPPED"
-                self.set_state(State.PROGRAM_STOPPED)
-                return
+            if self._prog_stop_requested():
+                return self._park_stopped("to_laser")
+            self.manual_program_state = "MOVING_TO_LASER"
+            r = self._prog_move("transfer", cfg["laser_mm"], cfg["transfer_rpm"], "Laser position")
+            if r != "ok":
+                return self._after_move(r, "to_laser", "Failed to move the transfer axis to the laser position")
+            if self._prog_stop_requested():
+                return self._park_stopped("fire")
+            self._fire_laser(0, cfg["laser_mm"], self._side_mm(0))
 
-            self.manual_program_state = "MOVING_NEXT"
-            self.manual_mark_enabled = False
-            self.manual_initial_ready = False
-            self.manual_pending_next_index = index
-            prev_index = max(0, index - 1)
-            prev_mm = float(positions[prev_index]["mm"])
-            target = float(positions[index]["mm"])
+    # ── OUT4 / OUT5 ─────────────────────────────────────────────────────────
 
-            if abs(target - prev_mm) > 0.001:
-                self.set_state(State.MOVING_Z)
-                self.log(f"Side {index + 1} position differs: {prev_mm:.3f} -> {target:.3f} mm")
-            else:
-                self.log(f"Side {index + 1} uses same axis position {target:.3f} mm")
-            # move_to skips motion if already in window; it also re-energises the axis after a Stop/Resume
-            ok = self.move_axis("transfer", 
-                target, 300,
-                stop_flag=lambda: self._manual_motion_stop or self.manual_stopped,
-                log_cb=self.log,
-            )
-            if not ok:
-                if self.manual_stopped or self._manual_motion_stop:
-                    self.manual_program_state = "PROGRAM_STOPPED"
-                    self.set_state(State.PROGRAM_STOPPED)
-                    return
-                self._manual_fault(f"Failed to move axis for side {index + 1}")
-                return
-
-            if self.manual_stopped:
-                self.manual_pending_next_index = index
-                self.manual_program_state = "PROGRAM_STOPPED"
-                self.set_state(State.PROGRAM_STOPPED)
-                return
-
-            self.manual_side_index = index
-            self.current_step = index + 1
-            self.manual_pending_next_index = None
-            self.manual_awaiting_result = True
-            self.manual_program_state = "WAITING_SIDE_RESULT"
-            self.set_state(State.LASER_FIRING)
-            pulse_ms = self.settings.get("laser", "pulse_ms") or 100
-            self.log(f"Starting side {index + 1}/{len(positions)} - GPIO17 pulse {pulse_ms} ms")
-            self.gpio.pulse_laser_start(pulse_ms)
-            self.set_state(State.WAITING_LASER)
-
-    # ── OUT4 / OUT5 manual protocol ────────────────────────────────────────
+    def _out_of_step(self, sig):
+        """An OUT4/OUT5 while the program is not waiting for a result means EzCad2
+        is running ahead of the controller - stop before anything is mis-marked."""
+        self._manual_fault(
+            f"{sig} arrived while the controller was not waiting for a result - "
+            "EzCad2 is out of step (it was not at 'Loading Started' when the cycle began). "
+            "Stop and restart the EzCad2 program, then RESET here.")
 
     def _on_out4(self):
         if not self.manual_program_started or not self.current_part:
-            self.log("OUT4 ignored - no manual Laser Program started")
+            self.log("OUT4 ignored - no Laser Program started")
+            return
+        if self.manual_awaiting_complete:
+            self._manual_fault("OUT4 arrived while waiting for the OUT5 that completes the part - "
+                               "EzCad2 is out of step")
             return
         if not self.manual_awaiting_result:
-            self.log("OUT4 ignored - program was not awaiting a side result")
+            if self.manual_program_state != "ERROR":
+                self._out_of_step("OUT4")
             return
-
         total = int(self.current_part["sides"])
         current = self.manual_side_index
-        if current >= total - 1:
-            self._manual_fault("Unexpected OUT4 after the configured last side; OUT5 was expected")
-            return
-
         self.manual_awaiting_result = False
         self.manual_out4_count += 1
-        next_index = current + 1
-        self.manual_side_index = next_index
-        self.current_step = next_index + 1
-        self.log(
-            f"OUT4 intermediate finish received - count {self.manual_out4_count}/{max(total - 1, 0)}; "
-            f"next side is {next_index + 1}/{total}"
-        )
-
-        if self.manual_stopped:
-            self.manual_pending_next_index = next_index
-            self.manual_program_state = "PROGRAM_STOPPED"
-            self.set_state(State.PROGRAM_STOPPED)
-            self.log("Program is stopped - next side stored and will continue on Resume")
+        if current >= total - 1:
+            # Last side: the part counts as complete only on OUT4 followed by OUT5
+            cfg = self.program_config()
+            self.manual_awaiting_complete = True
+            self.manual_result_deadline = time.monotonic() + cfg["complete_timeout_s"]
+            self.manual_program_state = "WAITING_PART_COMPLETE"
+            self.log(f"OUT4: last side {current + 1}/{total} finished - waiting for OUT5 to confirm the part")
             return
+        self.log(f"OUT4: side {current + 1}/{total} finished")
+        threading.Thread(target=self._next_side, args=(current + 1,), daemon=True).start()
 
-        threading.Thread(target=self._trigger_side, args=(next_index,), daemon=True).start()
+    def _next_side(self, index):
+        cfg = self.program_config()
+        with self._manual_operation_lock:
+            if self._prog_stop_requested():
+                return self._park_stopped(("side", index))
+            self.manual_program_state = "MOVING_NEXT_SIDE"
+            r = self._prog_move("laser", self._side_mm(index), cfg["laser_rpm"],
+                                f"Side {index + 1} height")
+            if r != "ok":
+                return self._after_move(r, ("side", index),
+                                        f"Failed to move the laser axis for side {index + 1}")
+            if self._prog_stop_requested():
+                return self._park_stopped(("fire", index))
+            self._fire_laser(index, cfg["laser_mm"], self._side_mm(index))
 
     def _on_out5(self):
         if not self.manual_program_started or not self.current_part:
-            self.log("OUT5 ignored - no manual Laser Program started")
+            self.log("OUT5 ignored - no Laser Program started")
             return
-        if not self.manual_awaiting_result:
-            self.log("OUT5 ignored - program was not awaiting part completion")
+        total = int(self.current_part["sides"])
+        current = self.manual_side_index
+
+        if self.manual_awaiting_complete:
+            # Expected: OUT4 (last side done) followed by OUT5 (part complete)
+            self.manual_awaiting_complete = False
+            self.manual_result_deadline = 0.0
+            self.manual_parts_completed += 1
+            self.cycle_count += 1
+            self.log(f"OUT5: OUT4+OUT5 sequence complete - part finished "
+                     f"({self.manual_parts_completed} total)")
+            threading.Thread(target=self._after_part, daemon=True).start()
             return
 
-        total = int(self.current_part["sides"])
-        if self.manual_side_index != total - 1:
-            self._manual_fault(
-                f"OUT5 arrived at side {self.manual_side_index + 1}, but recipe has {total} sides"
-            )
+        if not self.manual_awaiting_result:
+            # A short OUT5 right at EzCad2 program start is a reset glitch, not a result
+            if self.manual_program_state in ("READY_TO_MARK", "ERROR", "PROGRAM_STOPPED"):
+                self.log("OUT5 ignored - no side is running")
+                return
+            self._out_of_step("OUT5")
             return
 
         self.manual_awaiting_result = False
-        self.manual_parts_completed += 1
-        self.cycle_count = self.manual_parts_completed
-        self.log(f"OUT5 PART COMPLETE - part count {self.manual_parts_completed}")
+        if current != total - 1:
+            self._manual_fault(f"OUT5 received on side {current + 1}/{total} - OUT4 expected")
+        else:
+            self._manual_fault("OUT5 received on the last side without its OUT4 first - "
+                               "a part counts as complete only after OUT4 then OUT5")
 
-        # Reset per-part side tracking. The Laser Program remains started for
-        # the same selected recipe, exactly as requested.
-        self.manual_out4_count = 0
-        self.manual_side_index = 0
-        self.current_step = 1
-        self.manual_mark_enabled = False
-        self.manual_initial_ready = False
-        self.manual_pending_next_index = None
+    def _after_part(self):
+        delay = self.program_config()["out5_delay_s"]
+        self.manual_program_state = "RETURNING_LOAD"
+        self.set_state(State.RETURNING_INITIAL)
+        if delay > 0:
+            self.log(f"Waiting {delay:g} s before returning to the loading position")
+            end = time.monotonic() + delay
+            while time.monotonic() < end:
+                if self._prog_stop_requested():
+                    return self._park_stopped("to_loading")
+                time.sleep(0.05)
+        self._go_to_loading()
 
-        if self.manual_stopped:
-            self.manual_pending_return = True
-            self.manual_program_state = "PROGRAM_STOPPED"
-            self.set_state(State.PROGRAM_STOPPED)
-            self.log("Part complete while stopped - return to side 1 deferred until Resume")
+    # ── Result timeout watchdog ─────────────────────────────────────────────
+
+    def _check_result_timeout(self):
+        if not self.manual_result_deadline:
             return
-
-        self.manual_pending_return = True
-        threading.Thread(target=self._return_to_initial_after_part, daemon=True).start()
-
-    def _return_to_initial_after_part(self):
-        """Prepare the same recipe for the next physical part without requiring Start again."""
-        if not self.current_part:
+        if not (self.manual_awaiting_result or self.manual_awaiting_complete):
             return
-        target = float(self.current_part["positions"][0]["mm"])
-        with self._manual_operation_lock:
-            if self.manual_stopped:
-                self.manual_pending_return = True
-                return
-            self.manual_program_state = "RETURNING_INITIAL"
-            self.set_state(State.MOVING_Z)
-            self.log(f"Preparing next part - returning axis to side 1 position {target:.3f} mm")
-            ok = self.move_axis("transfer", 
-                target, 300,
-                stop_flag=lambda: self._manual_motion_stop or self.manual_stopped,
-                log_cb=self.log,
-            )
-            if not ok:
-                if self.manual_stopped or self._manual_motion_stop:
-                    self.manual_pending_return = True
-                    self.manual_program_state = "PROGRAM_STOPPED"
-                    self.set_state(State.PROGRAM_STOPPED)
-                    return
-                self._manual_fault("Failed to return axis to side 1 after part completion")
-                return
-
-            self.manual_pending_return = False
-            self.manual_side_index = 0
-            self.current_step = 1
-            self.manual_initial_ready = True
-            self.manual_mark_enabled = True
-            self.manual_program_state = "READY_TO_MARK"
-            self.set_state(State.READY_TO_MARK)
-            self.log("Next part ready - MARK and foot pedal enabled; Laser Program remains started")
+        if time.monotonic() > self.manual_result_deadline:
+            waiting_complete = self.manual_awaiting_complete
+            self.manual_awaiting_result = False
+            self.manual_awaiting_complete = False
+            self.manual_result_deadline = 0.0
+            cfg = self.program_config()
+            if waiting_complete:
+                self._manual_fault(f"Last side reported OUT4 but no OUT5 within "
+                                   f"{cfg['complete_timeout_s']:g} s - part not confirmed complete")
+            else:
+                self._manual_fault(f"No OUT4/OUT5 from EzCad2 within {cfg['result_timeout_s']:g} s - "
+                                   f"check the EzCad2 program")
 
     def _manual_fault(self, message):
         self._manual_motion_stop = True
-        self.drive.servo_off()
-        self.manual_error = message
+        self.manual_awaiting_result = False
+        self.manual_awaiting_complete = False
         self.manual_mark_enabled = False
         self.manual_initial_ready = False
-        self.manual_awaiting_result = False
         self.manual_program_state = "ERROR"
-        self.set_state(State.ERROR)
+        self.manual_error = message
+        for axis in AXES:
+            self.drives[axis].servo_off()
         self.log(f"MANUAL PROGRAM ERROR: {message}")
+        self.set_state(State.ERROR)
 
-    # ── Manual Stop / Resume / Reset ───────────────────────────────────────
+    # ── Stop / Resume / Reset ───────────────────────────────────────────────
 
     def stop_manual_program(self):
         if not self.manual_program_started:
-            return False, "Laser Program has not been started"
+            return False, "No Laser Program is started"
         self.manual_stopped = True
-        self.manual_mark_enabled = False
         self._manual_motion_stop = True
-        self.drive.servo_off()
-        self.manual_program_state = "PROGRAM_STOPPED"
-        self.set_state(State.PROGRAM_STOPPED)
-        if self.manual_awaiting_result:
-            self.log(
-                "Laser Program STOPPED while awaiting EzCad2. The axis will not move and no next side will be triggered. "
-                "Current EzCad2 marking cannot be aborted because no EzCad2 STOP output is wired."
-            )
-        else:
-            self.log("Laser Program STOPPED - Axis remains at its current position")
+        for axis in AXES:
+            self.ax[axis]["_stop"] = True
+            self.drives[axis].servo_off()
+        self.manual_mark_enabled = False
+        self.manual_initial_ready = False
+        if self.manual_program_state not in ("ERROR",):
+            self.manual_program_state = "PROGRAM_STOPPED"
+            self.set_state(State.PROGRAM_STOPPED)
+        self.log("Laser Program STOPPED - axes stopped where they are"
+                 + (" (EzCad2 keeps marking the current side)" if self.manual_awaiting_result else ""))
         return True, None
 
     def resume_manual_program(self):
         if not self.manual_program_started:
-            return False, "Laser Program has not been started"
+            return False, "No Laser Program is started"
+        if self.manual_program_state == "ERROR":
+            return False, "Clear the error with RESET first"
         if not self.manual_stopped:
             return False, "Laser Program is not stopped"
+        for axis in AXES:
+            if not self.drives[axis].online():
+                return False, f"{AXIS_CONFIG[axis]['name']} drive is not connected"
+            if not self.ax[axis]["reference"]:
+                return False, f"{AXIS_CONFIG[axis]['name']} lost its reference - home it again"
+            self.ax[axis]["_stop"] = False
         self.manual_stopped = False
         self._manual_motion_stop = False
-        self.manual_error = None
-        self.log("Laser Program RESUME")
+        pending = self.manual_pending
+        self.manual_pending = None
+        self.log(f"Laser Program RESUME ({pending or 'waiting'})")
 
         if self.manual_awaiting_result:
             self.manual_program_state = "WAITING_SIDE_RESULT"
             self.set_state(State.WAITING_LASER)
-            self.log("Resumed at current side - waiting for the existing EzCad2 OUT4/OUT5 result; not retriggering")
+            self.log("Still waiting for EzCad2 OUT4/OUT5 - no new pulse is sent")
             return True, None
-
-        if self.manual_pending_next_index is not None:
-            idx = self.manual_pending_next_index
-            threading.Thread(target=self._trigger_side, args=(idx,), daemon=True).start()
-            return True, None
-
-        if self.manual_pending_return:
-            threading.Thread(target=self._return_to_initial_after_part, daemon=True).start()
-            return True, None
-
-        if not self.manual_initial_ready:
-            threading.Thread(target=self._move_to_initial, daemon=True).start()
-            return True, None
-
-        self.manual_mark_enabled = True
-        self.manual_program_state = "READY_TO_MARK"
-        self.set_state(State.READY_TO_MARK)
+        if pending == "to_laser":
+            threading.Thread(target=self._go_to_laser, daemon=True).start()
+        elif pending == "fire":
+            cfg = self.program_config()
+            threading.Thread(target=lambda: self._fire_laser(0, cfg["laser_mm"], self._side_mm(0)),
+                             daemon=True).start()
+        elif isinstance(pending, tuple) and pending[0] == "side":
+            threading.Thread(target=self._next_side, args=(pending[1],), daemon=True).start()
+        elif isinstance(pending, tuple) and pending[0] == "fire":
+            cfg = self.program_config()
+            idx = pending[1]
+            threading.Thread(target=lambda: self._fire_laser(idx, cfg["laser_mm"], self._side_mm(idx)),
+                             daemon=True).start()
+        else:
+            threading.Thread(target=self._go_to_loading, daemon=True).start()
         return True, None
 
-    def reset_manual_program(self, confirm_abort=False):
-        if not self.manual_program_started or not self.current_part:
-            return False, "Laser Program has not been started"
-
-        # If EzCad2 failed and never returned OUT4/OUT5, recovery is allowed,
-        # but only after the operator has first stopped our sequence and then
-        # explicitly confirmed that EzCad2 itself is no longer marking.
-        if self.manual_awaiting_result:
-            if not self.manual_stopped:
-                return False, (
-                    "EzCad2 result is still outstanding. Press Laser Program STOP first, "
-                    "make sure EzCad2 marking has stopped, then press RESET."
-                )
-            if not confirm_abort:
-                return False, (
-                    "Reset confirmation required: confirm that EzCad2 marking has stopped "
-                    "before the transfer axis returns to side 1."
-                )
-            self.log(
-                "FORCED MANUAL RESET - operator confirmed EzCad2 has stopped; "
-                "discarding the outstanding OUT4/OUT5 result"
-            )
-
-        # Cancel any pending/unfinished side result and rebuild the manual
-        # cycle from side 1. Late OUT4/OUT5 edges are ignored because
-        # manual_awaiting_result is cleared before the axis is allowed to move.
-        self.manual_awaiting_result = False
+    def end_manual_program(self):
+        """End the run: stop both axes and release the program, keeping the part
+        selected so LASER PROGRAM START can be pressed again."""
+        if not self.manual_program_started:
+            return False, "No Laser Program is started"
+        self._manual_motion_stop = True
+        for axis in AXES:
+            self.ax[axis]["_stop"] = True
+            self.drives[axis].servo_off()
+        time.sleep(0.2)
+        self.manual_program_started = False
         self.manual_stopped = False
         self._manual_motion_stop = False
+        self.manual_awaiting_result = False
+        self.manual_awaiting_complete = False
+        self.manual_result_deadline = 0.0
         self.manual_mark_enabled = False
         self.manual_initial_ready = False
         self.manual_side_index = 0
-        self.current_step = 1
         self.manual_out4_count = 0
-        self.manual_pending_next_index = None
-        self.manual_pending_return = False
-        self.manual_program_state = "RESETTING"
+        self.manual_pending = None
         self.manual_error = None
-        self.set_state(State.RESETTING)
-        self.log("Laser Program RESET - side count cleared; moving to side 1 position")
-        threading.Thread(target=self._move_to_initial, daemon=True).start()
+        self.current_part = None
+        self.manual_program_state = "PART_SELECTED" if self.manual_selected_part_name else "NO_PART"
+        self.set_state(State.PROGRAM_SELECTED if self.manual_selected_part_name else State.READY)
+        self.log("Laser Program released - jog and homing are available again")
         return True, None
+
+    def reset_manual_program(self, confirm_abort=False):
+        """RESET ends the run: both axes stop, the program is released and
+        LASER PROGRAM START becomes available again. The part stays selected;
+        START then moves the axes back to the loading position."""
+        if not self.manual_program_started:
+            return False, "No Laser Program is started"
+        if self.manual_awaiting_result and not self.manual_stopped:
+            return False, "Press STOP first - EzCad2 may still be marking"
+        if (self.manual_awaiting_result or self.manual_awaiting_complete) and not confirm_abort:
+            return False, ("confirm_ezcad2: EzCad2 may still be marking or armed. "
+                           "Stop and restart the EzCad2 program, then confirm.")
+        ok, err = self.end_manual_program()
+        if ok:
+            self.log("Laser Program RESET - press LASER PROGRAM START to begin again")
+        return ok, err
 
     # ── Axis jog (per axis, toggle-enabled) ────────────────────────────────
 
@@ -1837,7 +1987,7 @@ class LaserController:
     # ── Automatic mode (legacy; not changed for the new manual side protocol) ─
 
     def start_auto(self, part_name, total_cycles):
-        if not PROGRAMS_ENABLED:
+        if not AUTO_ENABLED:
             self.log("Automatic cycle is disabled until the two-axis program logic is defined")
             return False
         if not self.position_ready():

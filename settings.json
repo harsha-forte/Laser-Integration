@@ -12,6 +12,16 @@
   "laser": {
     "pulse_ms": 300
   },
+  "program": {
+    "loading_mm": 0.0,
+    "laser_mm": 350.0,
+    "out5_delay_s": 1.0,
+    "result_timeout_s": 120,
+    "complete_timeout_s": 15,
+    "transfer_speed_rpm": 1000,
+    "laser_speed_rpm": 600,
+    "speed_override_pct": 100
+  },
   "reference_transfer": {
     "established": true,
     "abs_mode": true

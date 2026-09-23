@@ -9,7 +9,7 @@ from laser_ctrl import (
     controller, AXES, AXIS_CONFIG, MAX_TRAVEL_MM,
     PART_HEIGHT_MIN_MM, PART_HEIGHT_MAX_MM,
 )
-import threading, atexit
+import threading, atexit, time
 
 app = Flask(__name__)
 
@@ -213,11 +213,10 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',Arial,sans-se
               <div class="op-top">
                 <div>
                   <h2 class="op-title">Manual Laser Program</h2>
-                  <div class="op-copy">Select a valid part, start the laser program to position the transfer axis at Side 1, then start each part with the screen MARK button or GPIO22 foot pedal. OUT4 advances intermediate sides; OUT5 completes the part.</div>
+                  <div class="op-copy">START moves the transfer axis to the loading position and the laser axis to the Side 1 height. Load the part, then press MARK or the foot pedal: the transfer axis moves under the laser, both positions are verified and GPIO17 fires. OUT4 moves the laser axis to the next side height and fires again; OUT5 returns to the loading position.</div>
                 </div>
                 <span class="mode-chip" id="manual-mode-chip">not started</span>
               </div>
-              <div class="disabled-note prog-disabled-note">Manual program is disabled until the two-axis program logic is defined. Use Axis jog and Configure for now.</div>
 
               <div class="program-bar">
                 <button class="btn btn-green" id="btn-program-start" onclick="manualProgramStart()">LASER PROGRAM START</button>
@@ -252,7 +251,7 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',Arial,sans-se
                   <div class="sequence-box">
                     <div class="sequence-head"><span>Current recipe</span><span id="manual-step">0 / 0</span></div>
                     <div class="sequence-name" id="manual-summary-title">Select a part</div>
-                    <div class="sequence-copy" id="manual-summary-copy">Every side requires a configured axis position.</div>
+                    <div class="sequence-copy" id="manual-summary-copy">Every side requires a part height above {{ part_height_min }} mm.</div>
                     <div class="progress-track"><span id="manual-progress"></span></div>
                   </div>
                 </div>
@@ -263,7 +262,7 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',Arial,sans-se
           <div id="sub-auto" class="subtab-pane">
             <div class="operation">
               <div class="op-top"><div><h2 class="op-title">Automatic Cycle</h2><div class="op-copy">Run repeated laser cycles with robot placement and pickup handshake placeholders.</div></div><span class="mode-chip">sequence mode</span></div>
-              <div class="disabled-note prog-disabled-note">Automatic cycle is disabled until the two-axis program logic is defined.</div>
+              <div class="disabled-note auto-disabled-note">Automatic cycle is not redesigned for two axes yet.</div>
               <div class="auto-body">
                 <div class="field-panel">
                   <div class="field-title">Production quantity</div>
@@ -300,7 +299,7 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',Arial,sans-se
                   <div class="jog-note" id="jognote-transfer">--</div>
                   <div class="jog-pad horizontal">
                     <button class="jog-arrow" id="jog-transfer-left" data-axis="transfer" data-dir="left" title="Hold to jog left">&#9664;</button>
-                    <div><label>Max distance / mm</label><input type="number" id="jogdist-transfer" min="0.1" max="{{ t.max_travel_mm }}" step="0.1" value="1"></div>
+                    <div><label>Max distance / mm (0.1–{{ t.max_travel_mm|int }})</label><input type="number" id="jogdist-transfer" min="0.1" max="{{ t.max_travel_mm }}" step="0.1" value="1"></div>
                     <button class="jog-arrow" id="jog-transfer-right" data-axis="transfer" data-dir="right" title="Hold to jog right">&#9654;</button>
                   </div>
                   <button class="btn btn-red full" onclick="stopAxis('transfer')">STOP TRANSFER AXIS</button>
@@ -314,7 +313,7 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',Arial,sans-se
                   <div class="jog-note" id="jognote-laser">--</div>
                   <div class="jog-pad vertical">
                     <button class="jog-arrow" id="jog-laser-up" data-axis="laser" data-dir="up" title="Hold to jog up">&#9650;</button>
-                    <div class="jog-dist-box"><label>Max distance / mm</label><input type="number" id="jogdist-laser" min="0.1" max="{{ l.max_travel_mm }}" step="0.1" value="1"></div>
+                    <div class="jog-dist-box"><label>Max distance / mm (0.1–{{ l.max_travel_mm|int }})</label><input type="number" id="jogdist-laser" min="0.1" max="{{ l.max_travel_mm }}" step="0.1" value="1"></div>
                     <button class="jog-arrow" id="jog-laser-down" data-axis="laser" data-dir="down" title="Hold to jog down">&#9660;</button>
                   </div>
                   <button class="btn btn-red full" onclick="stopAxis('laser')">STOP LASER AXIS</button>
@@ -355,9 +354,9 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',Arial,sans-se
               <div class="settings-title">{{ t.name }} homing</div>
               <div class="homing-status"><span class="dot" id="home-dot-transfer"></span><span id="home-text-transfer">--</span></div>
               <div class="form-grid">
-                <div><label>Fast search speed / rpm</label><input type="number" id="h-fast-transfer" min="5" max="200" step="5"></div>
-                <div><label>Slow approach / rpm</label><input type="number" id="h-slow-transfer" min="1" max="50" step="1"></div>
-                <div class="span2"><label>Homing timeout / seconds</label><input type="number" id="h-timeout-transfer" min="10" max="600" step="10"></div>
+                <div><label>Fast search speed / rpm (5–200)</label><input type="number" id="h-fast-transfer" min="5" max="200" step="5"></div>
+                <div><label>Slow approach / rpm (1–50)</label><input type="number" id="h-slow-transfer" min="1" max="50" step="1"></div>
+                <div class="span2"><label>Homing timeout / seconds (10–600)</label><input type="number" id="h-timeout-transfer" min="10" max="600" step="10"></div>
               </div>
               <div class="help">Method 17: moves to the NL switch. Home is the switch release point (0 mm); the axis does not move further after homing.</div>
               <div class="btn2"><button class="btn btn-amber" id="btn-home-transfer" onclick="startHoming('transfer')">START HOMING</button><button class="btn btn-red" id="btn-hstop-transfer" onclick="stopHoming('transfer')">STOP HOMING</button></div>
@@ -367,21 +366,36 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',Arial,sans-se
               <div class="settings-title">{{ l.name }} homing</div>
               <div class="homing-status"><span class="dot" id="home-dot-laser"></span><span id="home-text-laser">--</span></div>
               <div class="form-grid">
-                <div><label>Fast search speed / rpm</label><input type="number" id="h-fast-laser" min="5" max="200" step="5"></div>
-                <div><label>Slow approach / rpm</label><input type="number" id="h-slow-laser" min="1" max="50" step="1"></div>
-                <div class="span2"><label>Homing timeout / seconds</label><input type="number" id="h-timeout-laser" min="10" max="600" step="10"></div>
+                <div><label>Fast search speed / rpm (5–200)</label><input type="number" id="h-fast-laser" min="5" max="200" step="5"></div>
+                <div><label>Slow approach / rpm (1–50)</label><input type="number" id="h-slow-laser" min="1" max="50" step="1"></div>
+                <div class="span2"><label>Homing timeout / seconds (10–600)</label><input type="number" id="h-timeout-laser" min="10" max="600" step="10"></div>
               </div>
               <div class="help">Method 17: moves down to the NL switch, then moves 2.5 mm up to 0 mm.</div>
               <div class="btn2"><button class="btn btn-amber" id="btn-home-laser" onclick="startHoming('laser')">START HOMING</button><button class="btn btn-red" id="btn-hstop-laser" onclick="stopHoming('laser')">STOP HOMING</button></div>
               <button class="btn btn-ghost full mt8" onclick="saveHomingSettings('laser')">SAVE HOMING PARAMETERS</button>
             </div>
             <div class="settings-card">
+              <div class="settings-title">Manual program</div>
+              <div class="form-grid">
+                <div><label>Loading position / mm (0–{{ t.max_travel_mm|int }})</label><input type="number" id="pg-load" min="0" max="{{ t.max_travel_mm }}" step="0.1"></div>
+                <div><label>Laser position / mm (0–{{ t.max_travel_mm|int }})</label><input type="number" id="pg-laser" min="0" max="{{ t.max_travel_mm }}" step="0.1"></div>
+                <div><label>Delay after OUT5 / s (0–60)</label><input type="number" id="pg-delay" min="0" max="60" step="0.1"></div>
+                <div><label>OUT4/OUT5 timeout / s (5–1800)</label><input type="number" id="pg-timeout" min="5" max="1800" step="5"></div>
+                <div><label>OUT5-after-OUT4 timeout / s (1–120)</label><input type="number" id="pg-ctimeout" min="1" max="120" step="1"></div>
+                <div><label>Transfer speed / rpm (10–3000)</label><input type="number" id="pg-trpm" min="10" max="3000" step="10"></div>
+                <div><label>Laser speed / rpm (10–3000)</label><input type="number" id="pg-lrpm" min="10" max="3000" step="10"></div>
+                <div class="span2"><label>Speed override / % (10–100) — scales both program speeds</label><input type="number" id="pg-ovr" min="10" max="100" step="5"></div>
+              </div>
+              <div class="help">Both transfer positions must respect the collision rule together with the part heights. Part heights below {{ part_height_min }} mm are rejected when a recipe is saved.</div>
+              <button class="btn btn-ghost full" onclick="saveProgramSettings()">SAVE PROGRAM PARAMETERS</button>
+            </div>
+            <div class="settings-card">
               <div class="settings-title">Group collision configuration</div>
               <div class="toggle-row" style="margin-bottom:12px"><div><div class="toggle-label">Collision rule active</div><div class="toggle-copy">Applies to jog, homing, manual and automatic moves</div></div>
                 <label class="toggle"><input type="checkbox" id="col-enabled"><span class="slider"></span></label></div>
               <div class="form-grid">
-                <div><label>Transfer axis limit / mm</label><input type="number" id="col-transfer" min="0" max="{{ t.max_travel_mm }}" step="0.1"></div>
-                <div><label>Laser axis minimum / mm</label><input type="number" id="col-laser" min="0" max="{{ l.max_travel_mm }}" step="0.1"></div>
+                <div><label>Transfer axis limit / mm (0–{{ t.max_travel_mm|int }})</label><input type="number" id="col-transfer" min="0" max="{{ t.max_travel_mm }}" step="0.1"></div>
+                <div><label>Laser axis minimum / mm (0–{{ l.max_travel_mm|int }})</label><input type="number" id="col-laser" min="0" max="{{ l.max_travel_mm }}" step="0.1"></div>
               </div>
               <div class="help" id="col-help">While the transfer axis is above its limit, the laser axis may not be below its minimum. Moves that would break the rule are blocked; jog moves stop at the limit. Unhomed or disconnected axes are treated as being in the worst position, so home the transfer axis before the laser axis.</div>
               <div class="homing-status" id="col-status"><span class="dot" id="col-dot"></span><span id="col-text">--</span></div>
@@ -389,7 +403,7 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',Arial,sans-se
             </div>
             <div class="settings-card">
               <div class="settings-title">Laser trigger</div>
-              <label>Laser trigger pulse / ms</label><input type="number" id="pulse-ms" min="50" max="2000" step="50" value="100">
+              <label>Laser trigger pulse / ms (50–2000)</label><input type="number" id="pulse-ms" min="50" max="2000" step="50" value="100">
               <div class="help">Duration GPIO 17 is held HIGH to trigger the marking start input.</div>
               <button class="btn btn-ghost full" onclick="saveLaserSettings()">SAVE LASER PARAMETER</button>
             </div>
@@ -405,7 +419,7 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',Arial,sans-se
     </section>
   </main>
 
-  <div class="log-wrap"><div class="log-hdr"><span class="log-title">Machine event terminal</span><button class="log-clear" onclick="clearLog()">CLEAR BUFFER</button></div><div class="log-box" id="log-box"></div></div>
+  <div class="log-wrap"><div class="log-hdr"><span class="log-title">Machine event terminal</span><button class="log-clear" onclick="copyLog()">COPY</button><button class="log-clear" onclick="downloadLog()">DOWNLOAD</button><button class="log-clear" onclick="clearLog()">CLEAR BUFFER</button></div><div class="log-box" id="log-box"></div></div>
 </div>
 
 <div class="overlay" id="modal"><div class="modal">
@@ -413,7 +427,7 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',Arial,sans-se
   <label>Part name</label><input type="text" id="edit-name" placeholder="e.g. Part_A">
   <div style="margin-top:12px"><label>Number of sides to be lasered</label><input type="number" id="edit-sides" min="1" max="64" step="1" value="1" onchange="renderSideRows()" oninput="renderSideRows()"></div>
   <div class="help">Required: every side must have an axis position. Different sides may use the same position.</div>
-  <table class="side-table"><thead><tr><th>Side</th><th>Required axis position / mm</th></tr></thead><tbody id="steps-wrap"></tbody></table>
+  <table class="side-table"><thead><tr><th>Side</th><th>Part height (laser axis) / mm ({{ part_height_min|int }}–{{ part_height_max|int }})</th></tr></thead><tbody id="steps-wrap"></tbody></table>
   <div class="modal-foot"><button class="btn btn-green" onclick="savePart()">SAVE PART</button><button class="btn btn-ghost" onclick="closeModal()">CANCEL</button></div>
 </div></div>
 
@@ -589,10 +603,11 @@ function updateStatus(d){
     msg.className='program-message';
     if(d.manual_error){msg.textContent=d.manual_error;msg.classList.add('err');}
     else if(d.manual_stopped && d.manual_awaiting_result){msg.textContent='Program stopped while waiting for EzCad2. RESUME keeps waiting, or RESET can recover after you confirm EzCad2 has stopped.';msg.classList.add('warn');}
-    else if(d.manual_stopped){msg.textContent='Program stopped. Axis holds position. RESUME continues from the stored current side.';msg.classList.add('warn');}
-    else if(d.manual_mark_enabled){msg.textContent='Ready for a new part. Press MARK or the GPIO22 foot pedal.';msg.classList.add('good');}
-    else if(d.manual_awaiting_result){msg.textContent=`Side ${side}/${total} is active. Waiting for ${side<total?'OUT4 intermediate finish':'OUT5 part complete'}.`;msg.classList.add('warn');}
-    else if(d.manual_program_state==='INITIALIZING'||d.manual_program_state==='RETURNING_INITIAL'||d.manual_program_state==='MOVING_NEXT'||d.manual_program_state==='RESETTING'){msg.textContent='Transfer axis positioning in progress. Operator start is locked.';msg.classList.add('warn');}
+    else if(d.manual_stopped){msg.textContent='Program stopped. Both axes stand where they are. RESUME continues the interrupted step.';msg.classList.add('warn');}
+    else if(d.manual_mark_enabled){msg.textContent='At the loading position. Load the part, then press MARK or the foot pedal.';msg.classList.add('good');}
+    else if(d.manual_awaiting_complete){msg.textContent='Last side reported OUT4. Waiting for OUT5 to confirm the part is complete.';msg.classList.add('warn');}
+    else if(d.manual_awaiting_result){msg.textContent=`Side ${side}/${total} is active. Waiting for ${side<total?'OUT4 (side finished)':'OUT4 then OUT5 (part complete)'}.`;msg.classList.add('warn');}
+    else if(['MOVING_TO_LOAD','MOVING_TO_LASER','MOVING_NEXT_SIDE','RETURNING_LOAD','RESETTING'].includes(d.manual_program_state)){msg.textContent='Axes are moving. Operator start is locked.';msg.classList.add('warn');}
     else if(d.manual_program_started){msg.textContent='Laser Program started.';msg.classList.add('good');}
     else {msg.textContent='Select a valid part, then press LASER PROGRAM START.';}
   }
@@ -607,7 +622,8 @@ function updateStatus(d){
   const resumeBtn=document.getElementById('btn-program-resume');
   const resetBtn=document.getElementById('btn-program-reset');
   const hasPart=!!document.getElementById('part-select').value;
-  if(startBtn) startBtn.disabled=!hasPart||!d.position_ready||d.manual_program_started;
+  const bothReady=!!(d.axes&&d.axes.transfer.ready&&d.axes.laser.ready);
+  if(startBtn) startBtn.disabled=!hasPart||!bothReady||d.manual_program_started;
   if(stopBtn) stopBtn.disabled=!d.manual_program_started||d.manual_stopped;
   if(resumeBtn) resumeBtn.disabled=!d.manual_program_started||!d.manual_stopped;
   // During a missing-OUT4/OUT5 recovery, RESET is intentionally enabled
@@ -615,15 +631,11 @@ function updateStatus(d){
   if(resetBtn) resetBtn.disabled=!d.manual_program_started||(d.manual_awaiting_result&&!d.manual_stopped);
 
   updateCollisionStatus(d.collision);
-  // Manual / Auto programs disabled until the two-axis logic is defined
-  const progOn=!!d.programs_enabled;
-  document.querySelectorAll('.prog-disabled-note').forEach(n=>n.style.display=progOn?'none':'block');
-  if(!progOn){
-    [startBtn,stopBtn,resumeBtn,resetBtn,mark,document.getElementById('btn-auto-start'),document.getElementById('btn-pause')]
+  // Automatic cycle is not redesigned for two axes yet
+  document.querySelectorAll('.auto-disabled-note').forEach(n=>n.style.display=d.auto_enabled?'none':'block');
+  if(!d.auto_enabled){
+    [document.getElementById('btn-auto-start'),document.getElementById('btn-pause')]
       .forEach(b=>{if(b) b.disabled=true;});
-    if(msg){msg.className='program-message warn';msg.textContent='Programs are disabled in this version.';}
-  } else {
-    const bas=document.getElementById('btn-auto-start'); if(bas) bas.disabled=!d.position_ready||d.manual_program_started;
   }
 }
 
@@ -657,10 +669,14 @@ function updateJogCard(k,a,col){
       if(k==='transfer'&&col.transfer_restricted){n=`Collision rule: transfer limited to ≤ ${col.transfer_limit_mm} mm`;cls+=' warn';}
     }}
   note.className=cls; note.textContent=n;
+  // NOTE: disabling a button that holds the pointer capture makes the browser
+  // fire lostpointercapture, which would cancel the jog the user is holding.
+  const holding=!!jogState[k];
   const canJog=a.connected&&a.homed&&a.jog_enabled&&!a.busy;
   card.classList.toggle('off',!a.jog_enabled);
   const btns=k==='transfer'?['left','right']:['up','down'];
-  btns.forEach(b=>{const el=document.getElementById(`jog-${k}-${b}`); if(el) el.disabled=!canJog;});
+  btns.forEach(b=>{const el=document.getElementById(`jog-${k}-${b}`);
+    if(el){const dis=!canJog&&!holding; if(el.disabled!==dis) el.disabled=dis;}});
 }
 
 // ── Signals ───────────────────────────────────────────────────────────────
@@ -674,7 +690,9 @@ function setDot(id,hi){
 }
 
 // ── Log ───────────────────────────────────────────────────────────────────
+let lastLogs=[];
 function updateLog(lines){
+  lastLogs=lines;
   const box=document.getElementById('log-box');
   const atBot=box.scrollHeight-box.scrollTop<=box.clientHeight+20;
   box.innerHTML=lines.map(l=>{
@@ -686,6 +704,19 @@ function updateLog(lines){
   if(atBot) box.scrollTop=box.scrollHeight;
 }
 function clearLog(){ fetch('/api/logs/clear',{method:'POST'}); }
+function logText(){ return (lastLogs||[]).join(String.fromCharCode(10)); }
+async function copyLog(){
+  const txt=logText();
+  try{ await navigator.clipboard.writeText(txt); showToast('Log copied to clipboard','good'); }
+  catch(e){
+    const ta=document.createElement('textarea'); ta.value=txt; ta.style.position='fixed'; ta.style.opacity='0';
+    document.body.appendChild(ta); ta.select();
+    try{ document.execCommand('copy'); showToast('Log copied to clipboard','good'); }
+    catch(_e){ showToast('Copy not allowed by the browser - use DOWNLOAD','err'); }
+    document.body.removeChild(ta);
+  }
+}
+function downloadLog(){ window.location='/api/logs/download'; }
 
 // ── Parts ─────────────────────────────────────────────────────────────────
 function loadParts(){
@@ -704,7 +735,7 @@ function onPartSelect(name){
   if(!name){
     document.getElementById('part-mini').textContent='No marking recipe selected';
     document.getElementById('manual-summary-title').textContent='Select a part';
-    document.getElementById('manual-summary-copy').textContent='Every side requires a configured axis position.';
+    document.getElementById('manual-summary-copy').textContent=`Every side requires a part height above ${PART_HEIGHT_MIN} mm.`;
     fetch('/api/manual/select',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({part:''})});
     return;
   }
@@ -779,7 +810,7 @@ function renderSideRows(existing=null){
   wrap.innerHTML='';
   for(let i=0;i<n;i++){
     const tr=document.createElement('tr');
-    tr.innerHTML=`<td>SIDE ${i+1}</td><td><input class="side-mm" type="number" min="${PART_HEIGHT_MIN}" max="${PART_HEIGHT_MAX}" step="0.1" value="${vals[i]??''}" placeholder="Required position, ${PART_HEIGHT_MIN}-${PART_HEIGHT_MAX} mm"></td>`;
+    tr.innerHTML=`<td>SIDE ${i+1}</td><td><input class="side-mm" type="number" min="${PART_HEIGHT_MIN}" max="${PART_HEIGHT_MAX}" step="0.1" value="${vals[i]??''}" placeholder="Part height, ${PART_HEIGHT_MIN}-${PART_HEIGHT_MAX} mm"></td>`;
     wrap.appendChild(tr);
   }
 }
@@ -796,7 +827,9 @@ function savePart(){
     const raw=inputs[i].value.trim();
     if(raw===''){showToast(`Height for side ${i+1} is required`,'err');return;}
     const mm=parseFloat(raw);
-    if(!Number.isFinite(mm)||mm<PART_HEIGHT_MIN||mm>PART_HEIGHT_MAX){showToast(`Side ${i+1} position must be ${PART_HEIGHT_MIN}-${PART_HEIGHT_MAX} mm`,'err');return;}
+    if(!Number.isFinite(mm)){showToast(`Side ${i+1}: enter a part height`,'err');return;}
+    if(mm<PART_HEIGHT_MIN){showToast(`Side ${i+1}: part height should be above ${PART_HEIGHT_MIN} mm`,'err');return;}
+    if(mm>PART_HEIGHT_MAX){showToast(`Side ${i+1}: part height must be at most ${PART_HEIGHT_MAX} mm`,'err');return;}
     positions.push({mm,label:`Side ${i+1}`});
   }
   fetch('/api/parts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,sides,positions})})
@@ -827,6 +860,24 @@ for(const axis of ['transfer','laser']){
     document.getElementById(`h-timeout-${axis}`).value=d.timeout;
   }).catch(()=>{});
 }
+
+// ── Manual program settings ───────────────────────────────────────────────
+const PG_FIELDS={'pg-load':'loading_mm','pg-laser':'laser_mm','pg-delay':'out5_delay_s','pg-timeout':'result_timeout_s','pg-ctimeout':'complete_timeout_s','pg-trpm':'transfer_speed_rpm','pg-lrpm':'laser_speed_rpm','pg-ovr':'speed_override_pct'};
+function loadProgramSettings(){
+  fetch('/api/settings/program').then(r=>r.json()).then(c=>{
+    for(const [id,key] of Object.entries(PG_FIELDS)) document.getElementById(id).value=c[key];
+  }).catch(()=>{});
+}
+function saveProgramSettings(){
+  const body={};
+  for(const [id,key] of Object.entries(PG_FIELDS)){
+    const v=parseFloat(document.getElementById(id).value);
+    if(!Number.isFinite(v)){showToast('Enter valid program values','err');return;}
+    body[key]=v;
+  }
+  axisCall('/api/settings/program',body).then(ok=>{if(ok){showToast('Program parameters saved','good');loadProgramSettings();}});
+}
+loadProgramSettings();
 
 // ── Group collision configuration ─────────────────────────────────────────
 function loadCollision(){
@@ -917,7 +968,8 @@ function jogEnd(axis){
 document.querySelectorAll('.jog-pad .jog-arrow[data-axis]').forEach(btn=>{
   const axis=btn.dataset.axis,dir=btn.dataset.dir;
   btn.addEventListener('pointerdown',e=>jogPress(axis,dir,e));
-  ['pointerup','pointercancel','lostpointercapture'].forEach(t=>btn.addEventListener(t,()=>jogRelease(axis)));
+  ['pointerup','pointercancel'].forEach(t=>btn.addEventListener(t,()=>jogRelease(axis)));
+  btn.addEventListener('pointerleave',e=>{if(!btn.hasPointerCapture||!btn.hasPointerCapture(e.pointerId)) jogRelease(axis);});
   btn.addEventListener('contextmenu',e=>e.preventDefault());
 });
 window.addEventListener('blur',()=>{jogRelease('transfer');jogRelease('laser');});
@@ -955,7 +1007,7 @@ function manualProgramReset(){
       'Recover Laser Program',
       'EzCad2 did not send the expected OUT4/OUT5 signal. Confirm that EzCad2 marking has stopped.',
       ()=>manualCall('/api/manual/reset',{confirm_abort:true}),
-      {confirmText:'RESET PROGRAM',warning:'RESET discards the pending laser result, clears the side count, and moves the transfer axis back to Side 1.'}
+      {confirmText:'RESET PROGRAM',warning:'RESET discards the pending laser result, stops both axes and ends the run. Press LASER PROGRAM START to begin again.'}
     );
     return;
   }
@@ -1015,6 +1067,14 @@ def api_signals():
 @app.route("/api/logs")
 def api_logs():
     return jsonify({"logs": controller.get_logs()})
+
+@app.route("/api/logs/download")
+def api_logs_download():
+    from flask import Response
+    name = time.strftime("laser-log-%Y%m%d-%H%M%S.txt")
+    body = "\n".join(controller.get_logs()) + "\n"
+    return Response(body, mimetype="text/plain",
+                    headers={"Content-Disposition": f"attachment; filename={name}"})
 
 @app.route("/api/logs/clear", methods=["POST"])
 def api_logs_clear():
@@ -1114,6 +1174,39 @@ def api_axis_stop():
     ok, err = controller.stop_axis(axis)
     return jsonify({"ok": ok, "error": err}), (200 if ok else 409)
 
+@app.route("/api/settings/program", methods=["GET"])
+def api_program_get():
+    return jsonify(controller.settings.get_section("program"))
+
+@app.route("/api/settings/program", methods=["POST"])
+def api_program_save():
+    data = request.get_json(silent=True) or {}
+    t_max = AXIS_CONFIG["transfer"]["max_travel_mm"]
+    limits = {
+        "loading_mm": (0, t_max), "laser_mm": (0, t_max),
+        "out5_delay_s": (0, 60), "result_timeout_s": (5, 1800),
+        "complete_timeout_s": (1, 120),
+        "transfer_speed_rpm": (10, 3000), "laser_speed_rpm": (10, 3000),
+        "speed_override_pct": (10, 100),
+    }
+    vals = {}
+    for k, (lo, hi) in limits.items():
+        if k not in data:
+            continue
+        try:
+            v = float(data[k])
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": f"{k} must be a number"}), 400
+        if not lo <= v <= hi:
+            return jsonify({"ok": False, "error": f"{k} must be {lo:g}-{hi:g}"}), 400
+        vals[k] = int(v) if k.endswith("rpm") or k.endswith("timeout_s") or k.endswith("pct") else v
+    if controller.manual_program_started:
+        return jsonify({"ok": False, "error": "Stop the Laser Program before changing its parameters"}), 409
+    controller.settings.update_section("program", vals)
+    controller.log(f"Program parameters saved: loading {vals.get('loading_mm')} mm, "
+                   f"laser {vals.get('laser_mm')} mm")
+    return jsonify({"ok": True})
+
 @app.route("/api/settings/collision", methods=["GET"])
 def api_collision_get():
     return jsonify(controller.settings.get_section("collision"))
@@ -1188,6 +1281,11 @@ def api_manual_stop():
 @app.route("/api/manual/resume", methods=["POST"])
 def api_manual_resume():
     ok, err = controller.resume_manual_program()
+    return jsonify({"ok": ok, "error": err}), (200 if ok else 409)
+
+@app.route("/api/manual/end", methods=["POST"])
+def api_manual_end():
+    ok, err = controller.end_manual_program()
     return jsonify({"ok": ok, "error": err}), (200 if ok else 409)
 
 @app.route("/api/manual/reset", methods=["POST"])

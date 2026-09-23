@@ -3,19 +3,19 @@
   "sides": 4,
   "positions": [
     {
-      "mm": 102.0,
+      "mm": 419.0,
       "label": "Side 1"
     },
     {
-      "mm": 108.0,
+      "mm": 400.0,
       "label": "Side 2"
     },
     {
-      "mm": 115.0,
+      "mm": 380.0,
       "label": "Side 3"
     },
     {
-      "mm": 116.0,
+      "mm": 360.0,
       "label": "Side 4"
     }
   ]
