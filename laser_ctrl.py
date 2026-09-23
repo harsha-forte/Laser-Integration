@@ -1,6 +1,25 @@
 """
 laser_ctrl.py — Laser marking automation engine
-Hardware: Raspberry Pi + A6-RS servo (RS485/Modbus RTU) + GPIO
+Hardware: Raspberry Pi + 2x A6-RS servo (CN6 USB / Modbus RTU) + GPIO
+
+Axes
+  transfer : horizontal, left-right, 5 mm/rev, 0-390 mm, /dev/transfer_axis
+             home = NL switch release point (0 mm), no move after homing
+  laser    : vertical, up-down, 4 mm/rev, 0-420 mm, /dev/laser_axis
+             home = NL switch release point -2.5 mm, then moves 2.5 mm up to 0 mm
+
+Drive layer (per axis)
+  - every Modbus frame verified (CRC, echo, exception reply); FC10 reply = 8 bytes
+  - comm failure is never treated as "arrived"; unplugged drive is detected and reconnected
+  - PP configuration verified/written once when the drive connects
+  - servo enable waits for U41.0A = 2 plus C05.13 delay before commanding
+  - arrival = position within tolerance AND speed 0 on two consecutive reads
+  - servo is ON only while an axis is moving (per-axis HOLD setting)
+  - one motion lock per axis: jog / homing / move on the same axis cannot interleave
+  - machine reference only trusted across power cycles when C00.07 = absolute mode
+
+Manual / Automatic programs are DISABLED (PROGRAMS_ENABLED = False) until the
+two-axis program logic is defined. The code is kept but cannot be started.
 """
 
 import time
@@ -22,16 +41,50 @@ except (ImportError, RuntimeError):
 # CONSTANTS
 # ═════════════════════════════════════════════════════════════════════════════
 
-SERIAL_PORT    = "/dev/ttyACM0"
 BAUD_RATE      = 115200
-DRIVE_ADDR     = 0x01
-# U40.16 and PP target positions are in drive COMMAND UNITS, not encoder pulses.
-# Verify this value from C00.02 and the mechanical travel per motor revolution:
-#   COMMAND_UNITS_PER_MM = C00.02 / mm_per_motor_revolution
-COMMAND_UNITS_PER_MM = 2500
-MAX_TRAVEL_MM        = 420.0
-PART_HEIGHT_MIN_MM    = 60.0
-PART_HEIGHT_MAX_MM    = 400.0
+DRIVE_ADDR     = 0x01          # both drives: address 1, each on its own USB port
+
+PROGRAMS_ENABLED = False       # Manual / Auto locked until program logic is defined
+
+# Per-axis configuration. Units: command units/mm = C00.02 / lead.
+AXIS_CONFIG = {
+    "transfer": {
+        "name":            "Transfer axis",
+        "port":            "/dev/transfer_axis",
+        "mm_per_rev":      5.0,
+        "pulses_per_rev":  10000,        # expected C00.02
+        "max_travel_mm":   390.0,
+        "home_offset_mm":  0.0,          # home coordinate at the NL release point
+        "home_then_zero":  False,        # no move after homing
+        "orientation":     "horizontal",
+        "home_side":       "left",       # end of travel where the NL/home switch is
+        "hold_after_move": False,        # servo ON only while moving
+        "jog_speed_rpm":   200,
+    },
+    "laser": {
+        "name":            "Laser axis",
+        "port":            "/dev/laser_axis",
+        "mm_per_rev":      4.0,
+        "pulses_per_rev":  10000,
+        "max_travel_mm":   420.0,
+        "home_offset_mm":  -2.5,         # NL release point = -2.5 mm ...
+        "home_then_zero":  True,         # ... then move 2.5 mm up to 0 mm
+        "orientation":     "vertical",   # 0 mm = bottom, + = up
+        "home_side":       "bottom",
+        # No brake on this axis. False = servo off after every move (as requested).
+        # If the axis sinks when the servo is off, set this to True.
+        "hold_after_move": False,
+        "jog_speed_rpm":   200,
+    },
+}
+AXES = tuple(AXIS_CONFIG)      # ("transfer", "laser")
+
+# Legacy names used by the (currently disabled) program code and the recipe editor
+SERIAL_PORT          = AXIS_CONFIG["transfer"]["port"]
+MAX_TRAVEL_MM        = AXIS_CONFIG["transfer"]["max_travel_mm"]
+HOME_SIDE            = AXIS_CONFIG["transfer"]["home_side"]
+PART_HEIGHT_MIN_MM   = 60.0
+PART_HEIGHT_MAX_MM   = MAX_TRAVEL_MM
 
 PARTS_DIR      = "parts"
 SETTINGS_FILE  = "settings.json"
@@ -52,21 +105,18 @@ PIN_MARKING_DONE = PIN_PART_COMPLETE
 # ═════════════════════════════════════════════════════════════════════════════
 
 DEFAULT_SETTINGS = {
-    "homing": {
-        "speed_fast":  50,       # rpm
-        "speed_slow":  10,       # rpm
-        "timeout":     200,      # seconds
-        "offset_mm":   -2.5,     # mm
-    },
+    "homing_transfer": {"speed_fast": 50, "speed_slow": 10, "timeout": 200},   # rpm, rpm, s
+    "homing_laser":    {"speed_fast": 50, "speed_slow": 10, "timeout": 200},
     "laser": {
         "pulse_ms":    100,      # ms — laser trigger pulse duration
     },
-    "absolute_position": {
-        # This becomes True only after a successful machine homing.
-        # It is intentionally persistent so normal power cycles do not
-        # require homing again when the battery-backed encoder retains data.
-        "reference_established": False,
-    }
+    # Saved machine reference per axis. Only trusted at startup when the drive
+    # is in absolute mode (C00.07 != 0) AND the reference was made in that mode.
+    "reference_transfer": {"established": False, "abs_mode": False},
+    "reference_laser":    {"established": False, "abs_mode": False},
+    # Group collision rule: while the transfer axis is above transfer_limit_mm,
+    # the laser axis may not be below laser_min_mm (manual, automatic and jog).
+    "collision": {"enabled": True, "transfer_limit_mm": 200.0, "laser_min_mm": 200.0},
 }
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -89,6 +139,7 @@ class State:
     READY_TO_MARK    = "READY_TO_MARK"
     PROGRAM_STOPPED  = "PROGRAM_STOPPED"
     RESETTING        = "RESETTING"
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # MODBUS
@@ -121,230 +172,384 @@ def r(grp, off, n=1):
 # DRIVE
 # ═════════════════════════════════════════════════════════════════════════════
 
-class A6Drive:
-    def __init__(self):
-        self.ser   = None
-        self._lock = threading.Lock()
+POS_TOL_MM        = 0.02     # arrival window
+BRAKE_CMD_DELAY_S = 0.15     # >= C05.13 (default 100 ms) + margin
 
+# Fixed drive configuration - checked when a drive connects, written only if different.
+# (group, offset, value, description)
+REQUIRED_CONFIG = [
+    (0x00, 0x00, 0,  "C00.00 control mode = position"),
+    (0x03, 0x00, 1,  "C03.00 reference = internal position planning"),
+    (0x11, 0x00, 3,  "C11.00 planning mode = PP"),
+    (0x11, 0x01, 0,  "C11.01 reference type = absolute"),
+    (0x11, 0x02, 1,  "C11.02 update = immediate"),
+    (0x11, 0x03, 1,  "C11.03 start group = 1"),
+    (0x11, 0x04, 1,  "C11.04 end group = 1"),
+    (0x04, 0x10, 1,  "C04.10 DI5 = S-ON"),
+    (0x04, 0x14, 19, "C04.14 DI6 = position planning trigger"),
+    (0x04, 0x38, 9,  "C04.38 DO5 = referencing completion"),
+]
+
+# Read-only sanity checks - reported, never written automatically.
+EXPECT = [
+    (0x0A, 0x0D, 0,  "C0A.0D CN6 storage (1 = every write goes to EEPROM)"),
+    (0x05, 0x00, -3, "C05.00 stop mode at S-ON off (-3 = zero-speed stop + dynamic brake)"),
+]
+
+
+class DriveError(Exception):
+    pass
+
+
+class A6Drive:
+    """One A6-RS drive on its own USB port. All geometry comes from AXIS_CONFIG."""
+
+    def __init__(self, key, cfg):
+        self.key = key
+        self.name = cfg["name"]
+        self.port = cfg["port"]
+        self.mm_per_rev = cfg["mm_per_rev"]
+        self.pulses_per_rev = cfg["pulses_per_rev"]
+        self.units_per_mm = self.pulses_per_rev / self.mm_per_rev
+        self.max_travel_mm = cfg["max_travel_mm"]
+        self.home_offset_mm = cfg["home_offset_mm"]
+        self.home_then_zero = cfg["home_then_zero"]
+        self.hold_default = cfg["hold_after_move"]
+        self.ser = None
+        self._lock = threading.Lock()          # one frame at a time
+        self.motion_lock = threading.RLock()   # one motion at a time on this axis
+        self.servo_is_on = False
+        self.abs_mode = None                   # C00.07, read in verify_config
+        self.config_ok = False                 # verify_config passed
+        self.last_ok = 0.0                     # monotonic time of last good frame
+        self.last_error = None
+
+    def _p(self, msg):
+        print(f"[{self.name}] {msg}")
+
+    # ── link ─────────────────────────────────────────────────────────────
     def connect(self):
         try:
-            self.ser = serial.Serial(SERIAL_PORT, BAUD_RATE,
-                                     bytesize=8, parity='N', stopbits=1,
-                                     timeout=0.5)
+            self.ser = serial.Serial(self.port, BAUD_RATE, bytesize=8,
+                                     parity='N', stopbits=1, timeout=0.3)
             return True
         except Exception as e:
-            print(f"[DRIVE] Connect failed: {e}")
+            self.ser = None
+            self.last_error = f"cannot open {self.port}: {e}"
             return False
 
     def disconnect(self):
-        if self.ser and self.ser.is_open:
-            self.ser.close()
-
-    def _send(self, frame, read_n=8):
-        if not self.ser or not self.ser.is_open:
-            return None
-        with self._lock:
-            try:
-                self.ser.reset_input_buffer()
-                self.ser.write(frame)
-                time.sleep(0.02)
-                return self.ser.read(read_n)
-            except Exception as e:
-                print(f"[DRIVE] Serial error: {e}")
-                return None
-
-    def write16(self, grp, off, val):
-        r = self._send(w16(grp, off, val))
-        return r is not None and len(r) >= 6
-
-    def write32(self, grp, off, val):
-        r = self._send(w32(grp, off, val), 12)
-        return r is not None and len(r) >= 6
-
-    def read16(self, grp, off):
-        resp = self._send(r(grp, off, 1), 7)
-        if resp and len(resp) >= 7:
-            v = (resp[3] << 8) | resp[4]
-            return v - 65536 if v > 32767 else v
-        return None
-
-    def read32(self, grp, off):
-        resp = self._send(r(grp, off, 2), 9)
-        if resp and len(resp) >= 9:
-            lo = (resp[3] << 8) | resp[4]
-            hi = (resp[5] << 8) | resp[6]
-            v  = (hi << 16) | lo
-            return v - 0x100000000 if v > 0x7FFFFFFF else v
-        return None
-
-    def servo_on(self):  return self.write16(0x04, 0x11, 1)
-    def servo_off(self): return self.write16(0x04, 0x11, 0)
-
-    def get_speed(self):
-        v = self.read16(0x40, 0x01)
-        return v if v is not None else 0
-
-    def get_position_raw(self):
-        """Return U40.16 absolute position feedback in command units."""
-        return self.read32(0x40, 0x16)
-
-    def get_position_mm(self):
-        p = self.get_position_raw()
-        return round(p / COMMAND_UNITS_PER_MM, 3) if p is not None else None
-
-    def get_encoder_position_raw(self):
-        """Return U40.18 absolute position feedback in encoder units."""
-        return self.read32(0x40, 0x18)
-
-    def get_state(self):
-        return self.read16(0x41, 0x0A)
-
-    def get_do_bits(self):
-        return self.read16(0x40, 0x05)
-
-    def jog(self, direction, distance_mm, speed_rpm=200):
-        """Jog up or down by distance_mm from current position."""
-        cur = self.get_position_mm()
-        if cur is None:
-            return False
-        target = cur + distance_mm if direction == "up" else cur - distance_mm
-        target = max(0.0, min(MAX_TRAVEL_MM, target))
-        return self.move_to(target, speed_rpm)
+        try:
+            if self.ser and self.ser.is_open:
+                self.ser.close()
+        except Exception:
+            pass
+        self.ser = None
+        self.config_ok = False
+        self.servo_is_on = False
 
     def connected(self):
         return self.ser is not None and self.ser.is_open
 
+    def online(self, max_age_s=2.0):
+        """Port open, configured, and the drive answered recently."""
+        return (self.connected() and self.config_ok
+                and time.monotonic() - self.last_ok < max_age_s)
+
+    def _xfer(self, frame, n):
+        """Send frame, return validated reply or raise DriveError."""
+        if not self.connected():
+            raise DriveError("port closed")
+        with self._lock:
+            try:
+                self.ser.reset_input_buffer()
+                self.ser.write(frame)
+                resp = self.ser.read(n)
+                if len(resp) >= 2 and resp[1] & 0x80:
+                    resp += self.ser.read(8)       # drain rest of error frame
+                    raise DriveError(f"exception reply {resp.hex(' ')} to {frame.hex(' ')}")
+            except (serial.SerialException, OSError) as e:
+                # USB unplugged / device gone: close so the monitor can reconnect
+                self.disconnect()
+                raise DriveError(f"serial link lost: {e}")
+        if len(resp) != n:
+            raise DriveError(f"short reply ({len(resp)}/{n}) to {frame.hex(' ')}")
+        if crc(resp[:-2]) != resp[-2:]:
+            raise DriveError(f"CRC error {resp.hex(' ')}")
+        self.last_ok = time.monotonic()
+        return resp
+
+    # ── raw access (raise on failure) ────────────────────────────────────
+    def w16(self, grp, off, val):
+        f = w16(grp, off, val)
+        if self._xfer(f, 8)[:6] != f[:6]:
+            raise DriveError(f"echo mismatch C{grp:02X}.{off:02X}")
+
+    def w32(self, grp, off, val):
+        f = w32(grp, off, val)
+        if self._xfer(f, 8)[:6] != f[:6]:          # FC10 reply = 8 bytes
+            raise DriveError(f"echo mismatch C{grp:02X}.{off:02X}")
+
+    def r16(self, grp, off, signed=True):
+        resp = self._xfer(r(grp, off, 1), 7)
+        v = (resp[3] << 8) | resp[4]
+        return v - 65536 if signed and v > 32767 else v
+
+    def r32(self, grp, off):
+        resp = self._xfer(r(grp, off, 2), 9)
+        lo = (resp[3] << 8) | resp[4]
+        hi = (resp[5] << 8) | resp[6]
+        v = (hi << 16) | lo
+        return v - 0x100000000 if v > 0x7FFFFFFF else v
+
+    # ── tolerant wrappers (return None on failure) ───────────────────────
+    def _safe(self, fn, *a):
+        try:
+            return fn(*a)
+        except DriveError as e:
+            self.last_error = str(e)
+            return None
+
+    def write16(self, grp, off, val):
+        try:
+            self.w16(grp, off, val); return True
+        except DriveError as e:
+            self.last_error = str(e); return False
+    def read16(self, grp, off):         return self._safe(self.r16, grp, off)
+    def read32(self, grp, off):         return self._safe(self.r32, grp, off)
+    def get_speed(self):                return self._safe(self.r16, 0x40, 0x01)   # None on failure
+    def get_position_raw(self):         return self._safe(self.r32, 0x40, 0x16)
+    def get_encoder_position_raw(self): return self._safe(self.r32, 0x40, 0x18)
+    def get_state(self):                return self._safe(self.r16, 0x41, 0x0A, False)
+    def get_do_bits(self):              return self._safe(self.r16, 0x40, 0x05, False)
+
+    def to_mm(self, units):
+        return round(units / self.units_per_mm, 3) if units is not None else None
+
+    def get_position_mm(self):
+        return self.to_mm(self.get_position_raw())
+
+    # ── servo enable / disable ───────────────────────────────────────────
+    def servo_off(self):
+        """Always safe to call (stop button, shutdown, fault)."""
+        if not self.connected():
+            self.servo_is_on = False
+            return False
+        try:
+            self.w16(0x04, 0x11, 0)
+            self.servo_is_on = False
+            return True
+        except DriveError as e:
+            self._p(f"servo_off failed: {e}")
+            return False
+
+    def servo_on(self, timeout=1.0):
+        """Enable and wait until the drive reports running + C05.13 delay."""
+        if self.servo_is_on and self.get_state() == 2:
+            return True
+        self.w16(0x04, 0x11, 1)
+        t_end = time.time() + timeout
+        while time.time() < t_end:
+            st = self.r16(0x41, 0x0A, False)
+            if st == 2:
+                time.sleep(BRAKE_CMD_DELAY_S)      # C05.13: no command right after S-ON
+                self.servo_is_on = True
+                return True
+            if st == 3:
+                raise DriveError("drive FAULT during enable")
+            time.sleep(0.02)
+        self.servo_off()
+        raise DriveError("servo did not reach running state")
+
     def clear_fault(self):
-        self.write16(0x31, 0x00, 1)
+        self._safe(self.w16, 0x31, 0x00, 1)
         time.sleep(0.2)
 
-    def move_to(self, target_mm, speed_rpm=300, stop_flag=None, log_cb=None):
-        """PP mode absolute move."""
-        def log(m):
-            if log_cb: log_cb(m)
-
-        if not (0.0 <= target_mm <= MAX_TRAVEL_MM):
-            log(f"Target {target_mm}mm out of range"); return False
-
-        command_units = int(target_mm * COMMAND_UNITS_PER_MM)
-        log(f"Moving to {target_mm:.2f}mm...")
-
-        self.servo_off(); time.sleep(0.05)
-
-        self.write16(0x00, 0x00, 0)
-        self.write16(0x03, 0x00, 1)
-        self.write16(0x11, 0x00, 3)
-        self.write16(0x11, 0x01, 0)
-        self.write16(0x11, 0x02, 1)
-        self.write16(0x11, 0x03, 1)
-        self.write16(0x11, 0x04, 1)
-        self.write16(0x04, 0x14, 19)
-
-        self.servo_on(); time.sleep(0.05)
-
-        self.write32(0x11, 0x06, command_units)
-        self.write16(0x11, 0x08, speed_rpm)
-        self.write32(0x11, 0x0A, 200)
-        self.write32(0x11, 0x0C, 200)
-
-        self.write16(0x04, 0x15, 1)
-        time.sleep(0.05)
-        self.write16(0x04, 0x15, 0)
-
-        time.sleep(0.1)
-        deadline = time.time() + 30
-        while time.time() < deadline:
-            if stop_flag and stop_flag():
-                log("Move stopped"); self.servo_off(); return False
-            if abs(self.get_speed()) == 0:
-                break
+    # ── configuration check (servo OFF) ──────────────────────────────────
+    def verify_config(self, log=print):
+        """Returns list of warnings. Writes only parameters that differ.
+        Raises DriveError if the drive is faulted or C00.02 does not match."""
+        warnings = []
+        self.config_ok = False
+        with self.motion_lock:
+            self.servo_off()
             time.sleep(0.1)
-        else:
-            log("Move timeout"); self.servo_off(); return False
+            st = self.r16(0x41, 0x0A, False)
+            if st == 3:
+                raise DriveError("drive in FAULT - clear it before configuring")
+            for grp, off, val, desc in REQUIRED_CONFIG:
+                cur = self.r16(grp, off, False)
+                if cur != val:
+                    log(f"Config: {desc} (was {cur}) -> writing")
+                    self.w16(grp, off, val)
+            for grp, off, val, desc in EXPECT:
+                cur = self.r16(grp, off)
+                if cur != val:
+                    warnings.append(f"{desc}: drive has {cur}")
+            ppr = self.r32(0x00, 0x02)                     # C00.02 pulses / rev
+            if ppr != self.pulses_per_rev:
+                raise DriveError(
+                    f"C00.02 = {ppr}, expected {self.pulses_per_rev} "
+                    f"({self.units_per_mm:g} units/mm at {self.mm_per_rev} mm/rev) - positions would be wrong")
+            log(f"C00.02 = {ppr} pulses/rev, lead {self.mm_per_rev} mm/rev -> {self.units_per_mm:g} units/mm")
+            self.abs_mode = self.r16(0x00, 0x07, False)    # C00.07
+            log(f"C00.07 = {self.abs_mode} ("
+                f"{'incremental - homing required after every power-up' if self.abs_mode == 0 else 'absolute mode'})")
+        for w in warnings:
+            log(f"WARNING: {w}")
+        self.config_ok = True
+        return warnings
 
-        self.servo_off()
-        log(f"Arrived at {self.get_position_mm():.2f}mm")
+    # ── motion ───────────────────────────────────────────────────────────
+    def move_to(self, target_mm, speed_rpm=300, stop_flag=None, log_cb=None, hold=None):
+        log = log_cb or (lambda m: None)
+        hold = self.hold_default if hold is None else hold
+        if not (0.0 <= target_mm <= self.max_travel_mm):
+            log(f"Target {target_mm}mm out of range [0-{self.max_travel_mm:g}]"); return False
+        if not self.motion_lock.acquire(blocking=False):
+            log("Move rejected - another motion is active on this axis"); return False
+        target = int(round(target_mm * self.units_per_mm))
+        tol = int(POS_TOL_MM * self.units_per_mm)
+        trig_on = False
+        pos = None
+        try:
+            start = self.r32(0x40, 0x16)
+            if abs(start - target) <= tol:
+                log(f"Already at {target_mm:.2f}mm")
+                if hold:
+                    self.servo_on()
+                return True
+
+            # 1. trajectory (During-operation params - no servo-off needed)
+            self.w32(0x11, 0x06, target)
+            self.w16(0x11, 0x08, speed_rpm)
+            self.w32(0x11, 0x0A, 200)
+            self.w32(0x11, 0x0C, 200)
+
+            # 2. enable and wait until really running
+            self.servo_on()
+
+            if stop_flag and stop_flag():                  # released before motion began
+                log("Move cancelled before start"); self.servo_off(); return False
+
+            # 3. trigger (edge; >= 3 ms width required, 50 ms used)
+            log(f"Moving to {target_mm:.2f}mm...")
+            self.w16(0x04, 0x15, 1); trig_on = True
+            time.sleep(0.05)
+            self.w16(0x04, 0x15, 0); trig_on = False
+
+            # 4. wait: in window AND stopped, twice in a row
+            dist_mm = abs(target - start) / self.units_per_mm
+            mm_s = max(speed_rpm, 1) * self.mm_per_rev / 60.0
+            deadline = time.time() + 5 + 2.0 * dist_mm / mm_s   # 2x nominal travel time + 5 s
+            ok_reads = 0
+            while time.time() < deadline:
+                if stop_flag and stop_flag():
+                    log("Move stopped"); self.servo_off(); return False
+                pos = self.r32(0x40, 0x16)
+                spd = self.r16(0x40, 0x01)
+                if abs(pos - target) <= tol and spd == 0:
+                    ok_reads += 1
+                    if ok_reads >= 2:
+                        break
+                else:
+                    ok_reads = 0
+                if self.r16(0x41, 0x0A, False) == 3:
+                    raise DriveError("drive FAULT during move")
+                time.sleep(0.05)
+            else:
+                log(f"Move timeout - at {self.to_mm(pos)}mm"); self.servo_off(); return False
+
+            log(f"Arrived at {self.to_mm(pos):.3f}mm")
+            if not hold:
+                self.servo_off()
+            return True
+
+        except DriveError as e:
+            log(f"DRIVE ERROR: {e}")
+            if trig_on:
+                self._safe(self.w16, 0x04, 0x15, 0)
+            self.servo_off()
+            return False
+        finally:
+            self.motion_lock.release()
+
+    def jog(self, positive, distance_mm, speed_rpm=200, stop_flag=None, log_cb=None):
+        """positive=True -> away from home (+mm)."""
+        cur = self.get_position_mm()
+        if cur is None:
+            return False
+        target = cur + distance_mm if positive else cur - distance_mm
+        target = round(max(0.0, min(self.max_travel_mm, target)), 3)
+        return self.move_to(target, speed_rpm, stop_flag=stop_flag, log_cb=log_cb)
+
+    def home(self, speed_fast, speed_slow, timeout_s, stop_flag=None, log_cb=None):
+        """Method 17 homing. Per the manual the drive stops just after the NL switch
+        releases and uses that stop position as home; C10.0B sets the coordinate
+        of that point. If home_then_zero, the axis then moves to 0 mm."""
+        log = log_cb or (lambda m: None)
+        if not self.motion_lock.acquire(blocking=False):
+            log("Homing rejected - another motion is active on this axis"); return False
+        try:
+            log("=== HOMING START (Method 17 - toward NL switch) ===")
+            self.servo_off(); time.sleep(0.1)
+            self.w16(0x10, 0x01, 17)
+            self.w16(0x10, 0x02, speed_fast)
+            self.w16(0x10, 0x03, speed_slow)
+            self.w32(0x10, 0x04, 1000)
+            self.w32(0x10, 0x06, 1000)
+            self.w32(0x10, 0x08, int(timeout_s * 1000))
+            self.w32(0x10, 0x0B, int(round(self.home_offset_mm * self.units_per_mm)))
+            self.servo_on()
+            self.w16(0x10, 0x00, 1)
+
+            deadline = time.time() + 3
+            while time.time() < deadline:
+                if stop_flag and stop_flag(): break
+                if abs(self.r16(0x40, 0x01)) > 2: break
+                time.sleep(0.1)
+            else:
+                log("No motion - check NL switch wiring")
+                self.w16(0x10, 0x00, 0); self.servo_off(); return False
+            log("Moving toward NL switch...")
+
+            deadline = time.time() + timeout_s
+            prev = None; stable = 0; pos = None
+            while time.time() < deadline:
+                if stop_flag and stop_flag():
+                    log("Homing stopped by user")
+                    self.w16(0x10, 0x00, 0); self.servo_off(); return False
+                do = self.r16(0x40, 0x05, False)
+                spd = self.r16(0x40, 0x01)
+                pos = self.r32(0x40, 0x16)
+                if (do & 0x10) == 0 and spd == 0:
+                    stable = stable + 1 if pos == prev else 0
+                    prev = pos
+                    if stable >= 2: break
+                time.sleep(0.2)
+            else:
+                log(f"Homing timeout after {timeout_s}s")
+                self.w16(0x10, 0x00, 0); self.servo_off(); return False
+
+            self.w16(0x10, 0x00, 0)
+            log(f"Home found - NL release point = {self.to_mm(pos):.3f}mm")
+            if not self.home_then_zero:
+                self.servo_off()
+        except DriveError as e:
+            log(f"DRIVE ERROR during homing: {e}")
+            self._safe(self.w16, 0x10, 0x00, 0)
+            self.servo_off()
+            return False
+        finally:
+            self.motion_lock.release()
+
+        if self.home_then_zero:
+            log(f"Moving {abs(self.home_offset_mm):g} mm to position 0 mm...")
+            if not self.move_to(0.0, 100, stop_flag=stop_flag, log_cb=log_cb):
+                log("Move to 0 mm after homing FAILED")
+                return False
+        log("=== HOMING COMPLETE - at 0.000 mm ===")
         return True
-
-    def home(self, speed_fast, speed_slow, timeout_s, offset_mm,
-             stop_flag=None, log_cb=None):
-        """Method 17 homing — moves DOWN to NL switch."""
-        def log(m):
-            if log_cb: log_cb(m)
-
-        offset_units = int(offset_mm * COMMAND_UNITS_PER_MM)
-        log("=== HOMING START (Method 17 — moving DOWN) ===")
-
-        self.servo_off(); time.sleep(0.3)
-
-        self.write16(0x10, 0x01, 17)
-        self.write16(0x10, 0x02, speed_fast)
-        self.write16(0x10, 0x03, speed_slow)
-        self.write32(0x10, 0x04, 1000)
-        self.write32(0x10, 0x06, 1000)
-        self.write32(0x10, 0x08, int(timeout_s * 1000))
-        self.write32(0x10, 0x0B, offset_units)
-
-        self.servo_on(); time.sleep(0.3)
-
-        if stop_flag and stop_flag():
-            log("Homing cancelled"); self.servo_off(); return False
-
-        state = self.get_state()
-        if state not in (1, 2):
-            log(f"Servo not ready (state={state})"); self.servo_off(); return False
-
-        self.write16(0x10, 0x00, 1)
-
-        # Confirm motion
-        deadline = time.time() + 3
-        moving = False
-        while time.time() < deadline:
-            if stop_flag and stop_flag(): break
-            if abs(self.get_speed()) > 2:
-                moving = True; break
-            time.sleep(0.1)
-
-        if not moving:
-            log("No motion — check NL switch wiring")
-            self.write16(0x10, 0x00, 0); self.servo_off(); return False
-
-        log("Moving DOWN to NL switch...")
-
-        # Wait for completion
-        deadline = time.time() + timeout_s
-        prev_pos = None; stable = 0
-        while time.time() < deadline:
-            if stop_flag and stop_flag():
-                log("Homing stopped by user")
-                self.write16(0x10, 0x00, 0); self.servo_off(); return False
-            do  = self.get_do_bits()
-            spd = abs(self.get_speed())
-            pos = self.read32(0x40, 0x16)
-            if do is not None and (do & 0x10) == 0 and spd == 0:
-                if pos == prev_pos: stable += 1
-                else: stable = 0
-                prev_pos = pos
-                if stable >= 2: break
-            time.sleep(0.2)
-        else:
-            log(f"Homing timeout after {timeout_s}s")
-            self.write16(0x10, 0x00, 0); self.servo_off(); return False
-
-        self.write16(0x10, 0x00, 0)
-        self.servo_off()
-        log(f"Homing complete — position: {self.get_position_mm():.2f}mm")
-
-        # Move to 0mm
-        log("Moving to position 0mm...")
-        ok = self.move_to(0.0, 100, stop_flag=stop_flag, log_cb=log_cb)
-        if ok:
-            log("=== AT POSITION 0mm — READY ===")
-        return ok
-
-# ═════════════════════════════════════════════════════════════════════════════
-# GPIO
-# ═════════════════════════════════════════════════════════════════════════════
 
 class GPIOManager:
     def __init__(self):
@@ -427,11 +632,23 @@ class SettingsManager:
             try:
                 with open(self._file) as f:
                     saved = json.load(f)
+                # Migrate single-axis settings from earlier versions
+                if "homing" in saved and "homing_transfer" not in saved:
+                    saved["homing_transfer"] = {k: v for k, v in saved["homing"].items()
+                                                if k in ("speed_fast", "speed_slow", "timeout")}
+                if "absolute_position" in saved and "reference_transfer" not in saved:
+                    old = saved["absolute_position"]
+                    saved["reference_transfer"] = {
+                        "established": bool(old.get("reference_established")),
+                        "abs_mode": bool(old.get("reference_abs_mode")),
+                    }
                 # Merge with defaults to handle missing keys
                 merged = json.loads(json.dumps(DEFAULT_SETTINGS))
                 for section, vals in saved.items():
                     if section in merged:
                         merged[section].update(vals)
+                    elif isinstance(vals, dict):
+                        merged[section] = vals      # keep e.g. "appearance"
                 return merged
             except Exception:
                 pass
@@ -479,7 +696,7 @@ class PartManager:
             return json.load(f)
 
     def validate(self, data):
-        """Every part must explicitly define side count and one Z height per side."""
+        """Every part must explicitly define side count and one axis position per side."""
         if not data:
             return False, "Part not found"
         name = str(data.get("name", "")).strip()
@@ -496,20 +713,20 @@ class PartManager:
 
         positions = data.get("positions")
         if not isinstance(positions, list):
-            return False, "A Z height is required for every side"
+            return False, "An axis position is required for every side"
         if len(positions) != sides:
-            return False, f"Part configuration incomplete: {sides} sides require {sides} height entries"
+            return False, f"Part configuration incomplete: {sides} sides require {sides} position entries"
 
         for idx, p in enumerate(positions, start=1):
             if not isinstance(p, dict) or p.get("mm") in (None, ""):
-                return False, f"Height for side {idx} is required"
+                return False, f"Position for side {idx} is required"
             try:
                 mm = float(p.get("mm"))
             except (TypeError, ValueError):
-                return False, f"Height for side {idx} is invalid"
+                return False, f"Position for side {idx} is invalid"
             if not (PART_HEIGHT_MIN_MM <= mm <= PART_HEIGHT_MAX_MM):
                 return False, (
-                    f"Side {idx} height {mm}mm is out of range "
+                    f"Side {idx} position {mm}mm is out of range "
                     f"[{PART_HEIGHT_MIN_MM:g}-{PART_HEIGHT_MAX_MM:g} mm]"
                 )
         return True, "Valid"
@@ -540,6 +757,7 @@ class PartManager:
             return True
         return False
 
+
 # ═════════════════════════════════════════════════════════════════════════════
 # LASER CONTROLLER
 # ═════════════════════════════════════════════════════════════════════════════
@@ -548,7 +766,7 @@ class LaserController:
     """Main controller.
 
     Manual mode uses an OUT4/OUT5 side protocol:
-      - Program Start moves to side 1 Z and arms MARK / foot pedal.
+      - Program Start moves to side 1 position and arms MARK / foot pedal.
       - UI MARK pulses GPIO17; foot pedal starts EzCad2 itself and GPIO22 only
         tells this controller that a cycle has started.
       - OUT4 advances to the next side and the Pi triggers that next side.
@@ -557,7 +775,8 @@ class LaserController:
     """
 
     def __init__(self):
-        self.drive    = A6Drive()
+        self.drives   = {k: A6Drive(k, AXIS_CONFIG[k]) for k in AXES}
+        self.drive    = self.drives["transfer"]   # legacy program code uses the transfer axis
         self.gpio     = GPIOManager()
         self.settings = SettingsManager()
         self.parts    = PartManager()
@@ -572,17 +791,31 @@ class LaserController:
         self.auto_advance   = False  # legacy Automatic/manual compatibility
         self.log_lines      = []
 
-        # Absolute position cache.
+        # Per-axis runtime state (filled by startup / telemetry).
+        self.ax = {k: {
+            "position": None, "raw": None, "speed": None,
+            "reference": False,          # homed / trusted reference
+            "busy": None,                # None | "homing" | "jog"
+            "jog_enabled": False,        # Axis-jog toggle
+            "error": None,
+            "warnings": [],
+            "_stop": False,              # per-axis stop request
+            "motion": None,              # (start_mm | None, target_mm) while a move/homing runs
+            "jog_id": 0,                 # id of the current hold-to-run jog
+            "jog_hb": 0.0,               # last "still holding" heartbeat (monotonic)
+            "_next_connect": 0.0,
+        } for k in AXES}
+        self._axis_lock = threading.Lock()
+
+        # Legacy single-axis fields (mirrors of the transfer axis)
         self.z_position                 = None
         self.z_position_raw             = None
         self.encoder_position_raw       = None
         self.encoder_position_available = False
-        self.speed_rpm                    = 0
-        self._telemetry_last_ok           = 0.0
-        self._telemetry_stop              = False
-        self._telemetry_thread            = None
-        abs_cfg = self.settings.get_section("absolute_position")
-        self.reference_established = bool(abs_cfg.get("reference_established", False))
+        self.speed_rpm                  = 0
+        self.reference_established      = False
+        self._telemetry_stop            = False
+        self._telemetry_thread          = None
 
         self._stop_flag      = False
         self._pause_flag     = False
@@ -627,43 +860,84 @@ class LaserController:
         self.state = s
         self.log(f"State -> {s}")
 
-    def _refresh_absolute_position(self):
-        raw = self.drive.get_position_raw()
+    def axis_log(self, axis, msg):
+        self.log(f"[{AXIS_CONFIG[axis]['name']}] {msg}")
+
+    def _refresh_absolute_position(self, axis="transfer"):
+        d = self.drives[axis]
+        raw = d.get_position_raw()
         if raw is not None:
-            self.z_position_raw = raw
-            self.z_position = round(raw / COMMAND_UNITS_PER_MM, 3)
-            self.encoder_position_available = True
+            a = self.ax[axis]
+            a["raw"] = raw
+            a["position"] = d.to_mm(raw)
+            if axis == "transfer":
+                self.z_position_raw = raw
+                self.z_position = a["position"]
+                self.encoder_position_available = True
         return raw
 
+    def axis_ready(self, axis):
+        """Drive online and a trusted reference exists."""
+        return bool(self.ax[axis]["reference"] and self.drives[axis].online())
+
+    def homing_required(self, axis):
+        return self.drives[axis].online() and not self.ax[axis]["reference"]
+
     def position_ready(self):
-        return bool(
-            self.reference_established
-            and self.encoder_position_available
-            and self.drive.connected()
-        )
+        # Legacy: the (disabled) programs only use the transfer axis
+        return self.axis_ready("transfer")
 
     def get_status(self):
-        # IMPORTANT: do not perform Modbus transactions in a Flask request.
-        # Telemetry is refreshed in one background thread so a slow/unresponsive
-        # drive cannot make browser status requests pile up and freeze the HMI.
+        # IMPORTANT: no Modbus transactions here - values come from telemetry.
+        axes = {}
+        for k in AXES:
+            d, a, cfg = self.drives[k], self.ax[k], AXIS_CONFIG[k]
+            axes[k] = {
+                "name": cfg["name"],
+                "orientation": cfg["orientation"],
+                "home_side": cfg["home_side"],
+                "max_travel_mm": cfg["max_travel_mm"],
+                "port": cfg["port"],
+                "port_open": d.connected(),
+                "connected": d.online(),
+                "position": a["position"],
+                "raw": a["raw"],
+                "speed": a["speed"],
+                "homed": a["reference"],
+                "homing_required": self.homing_required(k),
+                "ready": self.axis_ready(k),
+                "busy": a["busy"],
+                "jog_enabled": a["jog_enabled"],
+                "servo_on": d.servo_is_on,
+                "abs_mode": d.abs_mode,
+                "error": a["error"],
+                "warnings": a["warnings"],
+            }
         part = self.current_part
+        t = axes["transfer"]
         return {
             "state": self.state,
             "mode": self.mode,
+            "programs_enabled": PROGRAMS_ENABLED,
+            "axes": axes,
+            "homing_suggested": [axes[k]["name"] for k in AXES if axes[k]["homing_required"]],
+            "collision": self._collision_status(),
+
+            # Legacy single-axis keys (transfer axis)
             "part": part["name"] if part else self.manual_selected_part_name,
             "step": self.manual_side_index + 1 if self.manual_program_started and part else 0,
             "total_steps": int(part.get("sides", 0)) if part else 0,
             "cycle_count": self.cycle_count,
             "total_cycles": self.total_cycles,
-            "z_position": self.z_position,
-            "z_position_raw": self.z_position_raw,
-            "speed_rpm": self.speed_rpm,
-            "connected": self.drive.connected(),
+            "z_position": t["position"],
+            "z_position_raw": t["raw"],
+            "speed_rpm": t["speed"],
+            "connected": t["connected"],
             "auto_advance": self.auto_advance,
-            "encoder_position_available": self.encoder_position_available,
-            "reference_established": self.reference_established,
-            "position_ready": self.position_ready(),
-            "homed": self.reference_established,
+            "encoder_position_available": t["position"] is not None,
+            "reference_established": t["homed"],
+            "position_ready": t["ready"],
+            "homed": t["homed"],
 
             # Manual-program status for GUI interlocks.
             "manual_selected_part": self.manual_selected_part_name,
@@ -681,7 +955,135 @@ class LaserController:
             "manual_error": self.manual_error,
         }
 
-    # ── Telemetry cache ───────────────────────────────────────────────────
+    # ── Group collision rule ────────────────────────────────────────────────
+    #
+    # Forbidden state: transfer > transfer_limit_mm AND laser < laser_min_mm.
+    # "Worsening" moves (transfer increasing, laser decreasing, any homing from an
+    # unknown start) are checked against the other axis' possible positions,
+    # including any move it is currently executing. Unknown / unhomed positions
+    # are treated as worst case. Moves away from the zone are always allowed.
+
+    def collision_config(self):
+        c = self.settings.get_section("collision")
+        return (bool(c.get("enabled", True)),
+                float(c.get("transfer_limit_mm", 200.0)),
+                float(c.get("laser_min_mm", 200.0)))
+
+    def _axis_range(self, axis):
+        """(lo, hi) positions the axis may occupy now, or None if unknown."""
+        a = self.ax[axis]
+        pos = a["position"] if (a["reference"] and self.drives[axis].online()) else None
+        m = a["motion"]
+        if m:
+            if m[0] is None:
+                return None
+            vals = [m[0], m[1]] + ([pos] if pos is not None else [])
+            return (min(vals), max(vals))
+        return None if pos is None else (pos, pos)
+
+    def _collision_limit(self, axis):
+        """Limit a worsening target on `axis` must respect, or None if unrestricted."""
+        enabled, t_lim, l_min = self.collision_config()
+        if not enabled:
+            return None
+        if axis == "laser":
+            rng = self._axis_range("transfer")
+            return l_min if (rng is None or rng[1] > t_lim) else None
+        rng = self._axis_range("laser")
+        return t_lim if (rng is None or rng[0] < l_min) else None
+
+    def _begin_motion(self, axis, start_mm, target_mm, clamp=False, what="Move"):
+        """Check the collision rule and register the motion. Returns (target, error)."""
+        name = AXIS_CONFIG[axis]["name"]
+        with self._axis_lock:
+            if axis == "laser":
+                worsening = start_mm is None or target_mm < start_mm
+            else:
+                worsening = start_mm is None or target_mm > start_mm
+            if worsening:
+                lim = self._collision_limit(axis)
+                if lim is not None:
+                    bad = target_mm < lim if axis == "laser" else target_mm > lim
+                    if bad:
+                        room = (start_mm is not None and
+                                (start_mm > lim + 0.01 if axis == "laser" else start_mm < lim - 0.01))
+                        if clamp and room:
+                            self.axis_log(axis, f"{what} limited to {lim:g} mm by group collision rule")
+                            target_mm = lim
+                        else:
+                            _, t_lim, l_min = self.collision_config()
+                            if axis == "laser":
+                                why = (f"laser may not go below {l_min:g} mm while the transfer axis "
+                                       f"is (or may be) above {t_lim:g} mm")
+                            else:
+                                why = (f"transfer may not go above {t_lim:g} mm while the laser axis "
+                                       f"is (or may be) below {l_min:g} mm")
+                            return None, f"{name}: {what.lower()} blocked by group collision rule - {why}"
+            self.ax[axis]["motion"] = (start_mm, target_mm)
+            return target_mm, None
+
+    def _collision_status(self):
+        enabled, t_lim, l_min = self.collision_config()
+        return {
+            "enabled": enabled,
+            "transfer_limit_mm": t_lim,
+            "laser_min_mm": l_min,
+            # True when a worsening move on that axis is currently restricted
+            "laser_restricted": enabled and self._collision_limit("laser") is not None,
+            "transfer_restricted": enabled and self._collision_limit("transfer") is not None,
+        }
+
+    def _end_motion(self, axis):
+        self.ax[axis]["motion"] = None
+
+    def move_axis(self, axis, target_mm, speed_rpm=300, stop_flag=None, log_cb=None, hold=None):
+        """Single entry point for program moves - enforces the collision rule."""
+        d = self.drives[axis]
+        start = d.get_position_mm() if self.ax[axis]["reference"] else None
+        target, err = self._begin_motion(axis, start, float(target_mm))
+        if err:
+            (log_cb or self.log)(err)
+            return False
+        try:
+            return d.move_to(target, speed_rpm, stop_flag=stop_flag, log_cb=log_cb, hold=hold)
+        finally:
+            self._end_motion(axis)
+
+    # ── Drive connection / telemetry ────────────────────────────────────────
+
+    def _connect_axis(self, axis, quiet=False):
+        """Open port, check configuration, decide whether homing is required."""
+        d, a = self.drives[axis], self.ax[axis]
+        if not d.connect():
+            a["error"] = f"Drive not found on {d.port}"
+            if not quiet:
+                self.axis_log(axis, f"NOT CONNECTED - {d.last_error}")
+            return False
+        self.axis_log(axis, f"Connected on {d.port}")
+        try:
+            a["warnings"] = d.verify_config(lambda m: self.axis_log(axis, m))
+        except DriveError as e:
+            a["error"] = f"Configuration check failed: {e}"
+            self.axis_log(axis, a["error"])
+            d.disconnect()
+            return False
+        a["error"] = None
+        self._refresh_absolute_position(axis)
+        spd = d.get_speed()
+        a["speed"] = spd
+
+        saved = self.settings.get_section(f"reference_{axis}")
+        trusted = bool(saved.get("established") and saved.get("abs_mode")
+                       and d.abs_mode not in (None, 0))
+        a["reference"] = trusted
+        if saved.get("established") and not trusted:
+            self.settings.update_section(f"reference_{axis}", {"established": False})
+        if trusted:
+            self.axis_log(axis, f"Absolute mode + saved reference - position {a['position']} mm, homing not required")
+        else:
+            self.axis_log(axis, "HOMING REQUIRED - Configure > "
+                                f"{AXIS_CONFIG[axis]['name']} homing > START HOMING")
+        return True
 
     def _start_telemetry(self):
         if self._telemetry_thread and self._telemetry_thread.is_alive():
@@ -694,82 +1096,126 @@ class LaserController:
 
     def _telemetry_loop(self):
         while not self._telemetry_stop:
-            if self.drive.connected():
-                raw = self.drive.get_position_raw()
-                if raw is not None:
-                    self.z_position_raw = raw
-                    self.z_position = round(raw / COMMAND_UNITS_PER_MM, 3)
-                    self.encoder_position_available = True
-                    self._telemetry_last_ok = time.monotonic()
-                spd = self.drive.get_speed()
-                if spd is not None:
-                    self.speed_rpm = spd
+            for axis in AXES:
+                d, a = self.drives[axis], self.ax[axis]
+                if d.connected() and d.config_ok:
+                    self._refresh_absolute_position(axis)
+                    a["speed"] = d.get_speed()
+                    if not d.connected():            # link lost during the reads
+                        self._on_axis_lost(axis)
+                elif d.ser is not None:                  # was open, port closed underneath
+                    d.disconnect()
+                    self._on_axis_lost(axis)
+                elif not a["busy"] and time.monotonic() >= a["_next_connect"]:
+                    # Drive missing or unplugged: retry every 5 s
+                    a["_next_connect"] = time.monotonic() + 5.0
+                    was_error = a["error"]
+                    if self._connect_axis(axis, quiet=bool(was_error)):
+                        self.axis_log(axis, "Drive is online")
+            self._update_overall_state()
             time.sleep(0.35)
 
-    # ── Startup / absolute reference ────────────────────────────────────────
+    def _on_axis_lost(self, axis):
+        a = self.ax[axis]
+        a["reference"] = False                        # position can no longer be trusted
+        a["jog_enabled"] = False
+        a["position"] = a["raw"] = a["speed"] = None
+        a["error"] = "Drive connection lost"
+        a["_next_connect"] = time.monotonic() + 2.0
+        self.axis_log(axis, "CONNECTION LOST - reference cleared, homing required after reconnect")
+
+    def _update_overall_state(self):
+        if self.manual_program_started or self.state in (State.HOMING, State.MOVING_Z):
+            return
+        online = [k for k in AXES if self.drives[k].online()]
+        new = State.READY if online else State.ERROR
+        if new != self.state and self.state in (State.IDLE, State.READY, State.ERROR):
+            self.set_state(new)
+
+    # ── Startup ─────────────────────────────────────────────────────────────
 
     def startup(self):
         self.log("=== Laser Controller Starting ===")
-        if self.drive.connect():
-            self.log(f"Drive connected on {SERIAL_PORT}")
-            raw = None
-            for _ in range(5):
-                raw = self._refresh_absolute_position()
-                if raw is not None:
-                    break
-                time.sleep(0.20)
-            if raw is not None:
-                self.log(f"Absolute position read: {raw} command units ({self.z_position:.3f} mm)")
-                if self.reference_established:
-                    self.log("Machine reference valid - homing not required after this power cycle")
-                else:
-                    self.log("Absolute encoder readable, but machine reference is not established - home once")
-            else:
-                self.encoder_position_available = False
-                self.log("Could not read U40.16 absolute position - do not trust machine position")
-            # From here on, position/speed are refreshed in one background
-            # telemetry thread; Flask status requests only read cached values.
-            self._start_telemetry()
-            self.set_state(State.READY)
-            self._start_gpio_monitor()
-        else:
-            self.log("Drive connection failed")
-            self.set_state(State.ERROR)
+        for axis in AXES:
+            self._connect_axis(axis)
+            self.ax[axis]["_next_connect"] = time.monotonic() + 5.0
+        online = [AXIS_CONFIG[k]["name"] for k in AXES if self.drives[k].online()]
+        missing = [AXIS_CONFIG[k]["name"] for k in AXES if not self.drives[k].online()]
+        need = [AXIS_CONFIG[k]["name"] for k in AXES if self.homing_required(k)]
+        self.log(f"Drives online: {', '.join(online) or 'none'}"
+                 + (f" | NOT connected: {', '.join(missing)}" if missing else ""))
+        if need:
+            self.log(f"Homing suggested for: {', '.join(need)}")
+        if not PROGRAMS_ENABLED:
+            self.log("Manual / Automatic programs are disabled in this version")
+        self.set_state(State.READY if online else State.ERROR)
+        self._start_telemetry()
+        self._start_gpio_monitor()
 
-    def start_homing(self):
+    # ── Homing (per axis) ───────────────────────────────────────────────────
+
+    def start_homing(self, axis="transfer"):
+        if axis not in AXES:
+            return False, "Unknown axis"
         if self.manual_program_started:
-            self.log("Cannot home while Laser Program is started - Reset/finish program first")
-            return False
-        if self.state not in (State.READY, State.ERROR, State.IDLE, State.PROGRAM_SELECTED):
-            self.log("Cannot home - system busy")
-            return False
-        self._stop_flag = False
-        threading.Thread(target=self._do_home, daemon=True).start()
-        return True
+            return False, "Cannot home while a Laser Program is started"
+        d, a = self.drives[axis], self.ax[axis]
+        if not d.online():
+            return False, f"{d.name} drive is not connected"
+        with self._axis_lock:
+            if a["busy"]:
+                return False, f"{d.name} is busy ({a['busy']})"
+            a["busy"] = "homing"
+        # Homing drives toward the NL switch (below 0 mm) from a possibly unknown start
+        start = a["position"] if a["reference"] else None
+        _, err = self._begin_motion(axis, start, min(0.0, d.home_offset_mm), what="Homing")
+        if err:
+            a["busy"] = None
+            if axis == "laser":
+                err += ". Home the transfer axis first and keep it at or below the limit."
+            self.axis_log(axis, err)
+            return False, err
+        a["_stop"] = False
+        threading.Thread(target=self._do_home, args=(axis,), daemon=True).start()
+        return True, None
 
-    def stop_homing(self):
-        self._stop_flag = True
-        self.log("Homing stop requested")
+    def stop_homing(self, axis="transfer"):
+        if axis in AXES:
+            self.ax[axis]["_stop"] = True
+            self.axis_log(axis, "Homing stop requested")
 
-    def _do_home(self):
-        self.set_state(State.HOMING)
-        h = self.settings.get_section("homing")
-        ok = self.drive.home(
-            speed_fast=h["speed_fast"], speed_slow=h["speed_slow"],
-            timeout_s=h["timeout"], offset_mm=h["offset_mm"],
-            stop_flag=lambda: self._stop_flag, log_cb=self.log,
-        )
-        if ok:
-            self._refresh_absolute_position()
-            self.reference_established = True
-            self.settings.update_section("absolute_position", {"reference_established": True})
-            self.log("Machine Z reference established and saved")
-        self.set_state(State.READY if ok else State.ERROR)
+    def _do_home(self, axis):
+        d, a = self.drives[axis], self.ax[axis]
+        try:
+            h = self.settings.get_section(f"homing_{axis}")
+            a["reference"] = False
+            ok = d.home(
+                speed_fast=int(h["speed_fast"]), speed_slow=int(h["speed_slow"]),
+                timeout_s=int(h["timeout"]),
+                stop_flag=lambda: a["_stop"],
+                log_cb=lambda m: self.axis_log(axis, m),
+            )
+            self._refresh_absolute_position(axis)
+            if ok:
+                a["reference"] = True
+                a["error"] = None
+                abs_ok = d.abs_mode not in (None, 0)
+                self.settings.update_section(f"reference_{axis}",
+                                             {"established": True, "abs_mode": abs_ok})
+                self.axis_log(axis, "Reference established" +
+                              (" and saved (absolute mode)" if abs_ok
+                               else " - valid until power-off (incremental mode)"))
+            else:
+                a["error"] = "Homing failed or was stopped - home again"
+        finally:
+            self._end_motion(axis)
+            a["busy"] = None
 
-    def invalidate_position_reference(self):
-        self.reference_established = False
-        self.settings.update_section("absolute_position", {"reference_established": False})
-        self.log("Machine position reference invalidated - homing required")
+    def invalidate_position_reference(self, axis="transfer"):
+        self.ax[axis]["reference"] = False
+        self.settings.update_section(f"reference_{axis}",
+                                     {"established": False, "abs_mode": False})
+        self.axis_log(axis, "Position reference invalidated - homing required")
 
     # ── GPIO edge monitor ──────────────────────────────────────────────────
 
@@ -878,6 +1324,8 @@ class LaserController:
     # ── Manual Laser Program Start / Mark ──────────────────────────────────
 
     def start_manual_program(self, part_name):
+        if not PROGRAMS_ENABLED:
+            return False, "Manual program is disabled until the two-axis program logic is defined"
         if not self.position_ready():
             return False, "Trusted absolute machine position unavailable - home/check drive first"
         part = self.parts.load(part_name)
@@ -919,21 +1367,19 @@ class LaserController:
                 return
             self.manual_program_state = "INITIALIZING"
             self.set_state(State.MOVING_Z)
-            cur = self.drive.get_position_mm()
-            ok = True
-            if cur is None or abs(cur - target) > 0.05:
-                self.log(f"Laser Program Start - moving Z to side 1 initial height {target:.3f} mm")
-                ok = self.drive.move_to(
-                    target, 300,
-                    stop_flag=lambda: self._manual_motion_stop or self.manual_stopped,
-                    log_cb=self.log,
-                )
+            # move_to skips motion if already in window and energises the axis to hold it
+            self.log(f"Laser Program Start - axis to side 1 initial position {target:.3f} mm")
+            ok = self.move_axis("transfer", 
+                target, 300,
+                stop_flag=lambda: self._manual_motion_stop or self.manual_stopped,
+                log_cb=self.log,
+            )
             if not ok:
                 if self.manual_stopped or self._manual_motion_stop:
                     self.manual_program_state = "PROGRAM_STOPPED"
                     self.set_state(State.PROGRAM_STOPPED)
                 else:
-                    self.manual_error = "Failed to reach initial side height"
+                    self.manual_error = "Failed to reach initial side position"
                     self.manual_program_state = "ERROR"
                     self.set_state(State.ERROR)
                 return
@@ -951,12 +1397,14 @@ class LaserController:
                 self.log("Initial position reached - MARK button and GPIO22 foot pedal are enabled")
 
     def manual_mark(self, source="gui"):
+        if not PROGRAMS_ENABLED:
+            return False, "Manual program is disabled until the two-axis program logic is defined"
         if not self.manual_program_started or not self.current_part:
             return False, "Press Laser Program Start first"
         if self.manual_stopped:
             return False, "Laser Program is stopped - press Resume"
         if not self.manual_mark_enabled or not self.manual_initial_ready:
-            return False, "MARK is locked until Z is at the initial side position"
+            return False, "MARK is locked until the axis is at the initial side position"
         if self.manual_awaiting_result:
             return False, "Already waiting for EzCad2 OUT4/OUT5"
 
@@ -1004,21 +1452,22 @@ class LaserController:
 
             if abs(target - prev_mm) > 0.001:
                 self.set_state(State.MOVING_Z)
-                self.log(f"Side {index + 1} height differs: {prev_mm:.3f} -> {target:.3f} mm")
-                ok = self.drive.move_to(
-                    target, 300,
-                    stop_flag=lambda: self._manual_motion_stop or self.manual_stopped,
-                    log_cb=self.log,
-                )
-                if not ok:
-                    if self.manual_stopped or self._manual_motion_stop:
-                        self.manual_program_state = "PROGRAM_STOPPED"
-                        self.set_state(State.PROGRAM_STOPPED)
-                        return
-                    self._manual_fault(f"Failed to move Z for side {index + 1}")
-                    return
+                self.log(f"Side {index + 1} position differs: {prev_mm:.3f} -> {target:.3f} mm")
             else:
-                self.log(f"Side {index + 1} uses same Z height {target:.3f} mm - no motor move")
+                self.log(f"Side {index + 1} uses same axis position {target:.3f} mm")
+            # move_to skips motion if already in window; it also re-energises the axis after a Stop/Resume
+            ok = self.move_axis("transfer", 
+                target, 300,
+                stop_flag=lambda: self._manual_motion_stop or self.manual_stopped,
+                log_cb=self.log,
+            )
+            if not ok:
+                if self.manual_stopped or self._manual_motion_stop:
+                    self.manual_program_state = "PROGRAM_STOPPED"
+                    self.set_state(State.PROGRAM_STOPPED)
+                    return
+                self._manual_fault(f"Failed to move axis for side {index + 1}")
+                return
 
             if self.manual_stopped:
                 self.manual_pending_next_index = index
@@ -1121,23 +1570,21 @@ class LaserController:
                 self.manual_pending_return = True
                 return
             self.manual_program_state = "RETURNING_INITIAL"
-            cur = self.drive.get_position_mm()
-            if cur is None or abs(cur - target) > 0.05:
-                self.set_state(State.MOVING_Z)
-                self.log(f"Preparing next part - returning Z to side 1 height {target:.3f} mm")
-                ok = self.drive.move_to(
-                    target, 300,
-                    stop_flag=lambda: self._manual_motion_stop or self.manual_stopped,
-                    log_cb=self.log,
-                )
-                if not ok:
-                    if self.manual_stopped or self._manual_motion_stop:
-                        self.manual_pending_return = True
-                        self.manual_program_state = "PROGRAM_STOPPED"
-                        self.set_state(State.PROGRAM_STOPPED)
-                        return
-                    self._manual_fault("Failed to return Z to side 1 after part completion")
+            self.set_state(State.MOVING_Z)
+            self.log(f"Preparing next part - returning axis to side 1 position {target:.3f} mm")
+            ok = self.move_axis("transfer", 
+                target, 300,
+                stop_flag=lambda: self._manual_motion_stop or self.manual_stopped,
+                log_cb=self.log,
+            )
+            if not ok:
+                if self.manual_stopped or self._manual_motion_stop:
+                    self.manual_pending_return = True
+                    self.manual_program_state = "PROGRAM_STOPPED"
+                    self.set_state(State.PROGRAM_STOPPED)
                     return
+                self._manual_fault("Failed to return axis to side 1 after part completion")
+                return
 
             self.manual_pending_return = False
             self.manual_side_index = 0
@@ -1149,6 +1596,8 @@ class LaserController:
             self.log("Next part ready - MARK and foot pedal enabled; Laser Program remains started")
 
     def _manual_fault(self, message):
+        self._manual_motion_stop = True
+        self.drive.servo_off()
         self.manual_error = message
         self.manual_mark_enabled = False
         self.manual_initial_ready = False
@@ -1170,11 +1619,11 @@ class LaserController:
         self.set_state(State.PROGRAM_STOPPED)
         if self.manual_awaiting_result:
             self.log(
-                "Laser Program STOPPED while awaiting EzCad2. Z will not move and no next side will be triggered. "
+                "Laser Program STOPPED while awaiting EzCad2. The axis will not move and no next side will be triggered. "
                 "Current EzCad2 marking cannot be aborted because no EzCad2 STOP output is wired."
             )
         else:
-            self.log("Laser Program STOPPED - Z remains at its current position")
+            self.log("Laser Program STOPPED - Axis remains at its current position")
         return True, None
 
     def resume_manual_program(self):
@@ -1227,7 +1676,7 @@ class LaserController:
             if not confirm_abort:
                 return False, (
                     "Reset confirmation required: confirm that EzCad2 marking has stopped "
-                    "before the Z axis returns to side 1."
+                    "before the transfer axis returns to side 1."
                 )
             self.log(
                 "FORCED MANUAL RESET - operator confirmed EzCad2 has stopped; "
@@ -1250,24 +1699,147 @@ class LaserController:
         self.manual_program_state = "RESETTING"
         self.manual_error = None
         self.set_state(State.RESETTING)
-        self.log("Laser Program RESET - side count cleared; moving to side 1 height")
+        self.log("Laser Program RESET - side count cleared; moving to side 1 position")
         threading.Thread(target=self._move_to_initial, daemon=True).start()
         return True, None
 
-    # ── Jog ────────────────────────────────────────────────────────────────
+    # ── Axis jog (per axis, toggle-enabled) ────────────────────────────────
 
-    def jog(self, direction, distance_mm, speed_rpm=200):
+    JOG_DIRECTIONS = {
+        # direction -> positive (+mm, away from home)?
+        "transfer": {"left": None, "right": None, "plus": True, "minus": False},
+        "laser":    {"up": True, "down": False, "plus": True, "minus": False},
+    }
+
+    def set_jog_enabled(self, axis, on):
+        if axis not in AXES:
+            return False, "Unknown axis"
+        a = self.ax[axis]
+        if on:
+            if not self.drives[axis].online():
+                return False, f"{AXIS_CONFIG[axis]['name']} drive is not connected"
+            a["jog_enabled"] = True
+            self.axis_log(axis, "Jog ENABLED")
+        else:
+            a["jog_enabled"] = False
+            if a["busy"] == "jog":
+                a["_stop"] = True                     # stops the running jog; servo goes off
+            self.axis_log(axis, "Jog DISABLED")
+        return True, None
+
+    def stop_axis(self, axis):
+        """Stop only this axis (jog or homing). The jog toggle stays as it is."""
+        if axis not in AXES:
+            return False, "Unknown axis"
+        a = self.ax[axis]
+        a["_stop"] = True
+        if not a["busy"]:
+            self.drives[axis].servo_off()
+        self.axis_log(axis, "STOP")
+        return True, None
+
+    JOG_DEADMAN_S = 0.5      # no heartbeat for this long -> treated as released
+
+    def jog_hold(self, axis, jog_id):
+        """Heartbeat from the browser while the arrow is still held."""
+        a = self.ax.get(axis)
+        if a and a["busy"] == "jog" and a["jog_id"] == jog_id:
+            a["jog_hb"] = time.monotonic()
+            return True
+        return False
+
+    def jog_release(self, axis, jog_id=None):
+        """Arrow released: stop this jog (the toggle stays ON)."""
+        a = self.ax.get(axis)
+        if a and a["busy"] == "jog" and (jog_id is None or a["jog_id"] == jog_id):
+            a["_stop"] = True
+        return True
+
+    def jog(self, axis, direction, distance_mm):
+        """Start a hold-to-run jog of at most distance_mm.
+        Returns (ok, error, jog_id). The move stops on release, on a missing
+        heartbeat (dead-man), at the entered distance, or at any limit."""
+        ok, err = self._jog_start(axis, direction, distance_mm)
+        return ok, err, (self.ax[axis]["jog_id"] if ok else None)
+
+    def _jog_start(self, axis, direction, distance_mm):
+        if axis not in AXES:
+            return False, "Unknown axis"
+        cfg, d, a = AXIS_CONFIG[axis], self.drives[axis], self.ax[axis]
+        if direction not in self.JOG_DIRECTIONS[axis]:
+            return False, f"Invalid direction '{direction}' for {cfg['name']}"
+        try:
+            distance_mm = float(distance_mm)
+        except (TypeError, ValueError):
+            return False, "Invalid jog distance"
+        if not (0.0 < distance_mm <= cfg["max_travel_mm"]):
+            return False, f"Jog distance must be 0.1-{cfg['max_travel_mm']:g} mm"
         if self.manual_program_started:
-            self.log("Jog blocked - stop/end the manual Laser Program before service jog")
+            return False, "Jog is locked while a Laser Program is started"
+        if not a["jog_enabled"]:
+            return False, f"Switch {cfg['name']} ON first"
+        if not d.online():
+            return False, f"{cfg['name']} drive is not connected"
+        if not a["reference"]:
+            return False, f"{cfg['name']} is not homed - home it first"
+
+        positive = self.JOG_DIRECTIONS[axis][direction]
+        if positive is None:                          # transfer left/right
+            positive = (direction == "right") == (cfg["home_side"] == "left")
+
+        with self._axis_lock:
+            if a["busy"]:
+                return False, f"{cfg['name']} is busy ({a['busy']})"
+            a["busy"] = "jog"
+
+        cur = d.get_position_mm()
+        if cur is None:
+            a["busy"] = None
+            return False, f"{cfg['name']}: position could not be read"
+        target = cur + distance_mm if positive else cur - distance_mm
+        target = round(max(0.0, min(cfg["max_travel_mm"], target)), 3)
+        target, err = self._begin_motion(axis, cur, target, clamp=True, what="Jog")
+        if err:
+            a["busy"] = None
+            self.axis_log(axis, err)
+            return False, err
+        a["_stop"] = False
+        a["jog_id"] += 1
+        a["jog_hb"] = time.monotonic()
+
+        def released():
+            if a["_stop"] or not a["jog_enabled"]:
+                return True
+            if time.monotonic() - a["jog_hb"] > self.JOG_DEADMAN_S:
+                self.axis_log(axis, "Jog heartbeat lost - stopping (dead-man)")
+                return True
             return False
-        if not self.position_ready():
-            self.log("Jog blocked - trusted absolute machine position unavailable")
-            return False
-        return self.drive.jog(direction, distance_mm, speed_rpm)
+
+        def run():
+            try:
+                self.axis_log(axis, f"Jog {direction} (hold) up to {target:.3f} mm")
+                quiet = ("Moving to", "Arrived", "Move stopped", "Move cancelled", "Already at")
+                ok = d.move_to(target, cfg["jog_speed_rpm"], stop_flag=released,
+                               log_cb=lambda m: None if m.startswith(quiet) else self.axis_log(axis, m))
+                pos = d.get_position_mm()
+                if ok:
+                    self.axis_log(axis, f"Jog reached {target:.3f} mm - stopped")
+                elif d.connected():
+                    self.axis_log(axis, f"Jog stopped at {pos if pos is not None else '--'} mm")
+                else:
+                    self._on_axis_lost(axis)
+            finally:
+                self._end_motion(axis)
+                a["busy"] = None
+        threading.Thread(target=run, daemon=True).start()
+        return True, None
 
     # ── Automatic mode (legacy; not changed for the new manual side protocol) ─
 
     def start_auto(self, part_name, total_cycles):
+        if not PROGRAMS_ENABLED:
+            self.log("Automatic cycle is disabled until the two-axis program logic is defined")
+            return False
         if not self.position_ready():
             self.log("Auto start blocked - trusted absolute machine position unavailable")
             return False
@@ -1311,7 +1883,7 @@ class LaserController:
                 target = pos_cfg["mm"]
                 label = pos_cfg.get("label", f"Step {idx + 1}")
                 self.set_state(State.MOVING_Z)
-                ok = self.drive.move_to(target, 300, stop_flag=lambda: self._stop_flag, log_cb=self.log)
+                ok = self.move_axis("transfer", target, 300, stop_flag=lambda: self._stop_flag, log_cb=self.log)
                 if not ok:
                     self.set_state(State.ERROR)
                     self._stop_flag = True
@@ -1334,6 +1906,7 @@ class LaserController:
             time.sleep(1.0)
             self.log("[OPC UA] Robot confirmed: part picked")
             self.log(f"Cycle {self.cycle_count} complete")
+        self.drive.servo_off()              # release the axis at end of auto run
         if self.state != State.ERROR:
             self.set_state(State.READY)
         self.log(f"=== AUTO DONE - {self.cycle_count} cycles completed ===")
@@ -1364,16 +1937,17 @@ class LaserController:
             time.sleep(0.05)
         return True
 
-    # ── Legacy/global controls ─────────────────────────────────────────────
+    # ── Global controls ────────────────────────────────────────────────────
 
     def stop(self):
-        # Header emergency/global STOP. Manual program gets the same safe stop
-        # behavior; automatic mode uses the legacy global stop flag.
+        # Header EMERGENCY STOP: stop every axis, switch servos off, lock jog.
         if self.manual_program_started:
             self.stop_manual_program()
         self._stop_flag = True
-        self.drive.servo_off()
-        self.log("GLOBAL STOP")
+        for axis in AXES:
+            self.ax[axis]["_stop"] = True
+            self.drives[axis].servo_off()
+        self.log("EMERGENCY STOP - all axes stopped, servos off")
 
     def pause_resume(self):
         self._pause_flag = not self._pause_flag
@@ -1393,8 +1967,10 @@ class LaserController:
         self._telemetry_stop = True
         self._stop_flag = True
         self._manual_motion_stop = True
-        self.drive.servo_off()
-        self.drive.disconnect()
+        for axis in AXES:
+            self.ax[axis]["_stop"] = True
+            self.drives[axis].servo_off()
+            self.drives[axis].disconnect()
         self.gpio.cleanup()
         self.log("Shutdown complete")
 

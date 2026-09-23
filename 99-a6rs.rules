@@ -1,0 +1,3 @@
+# A6-RS servo drives - fixed device names
+SUBSYSTEM=="tty", ATTRS{idVendor}=="28e9", ATTRS{idProduct}=="018a", ATTRS{serial}=="5568756514B0", SYMLINK+="transfer_axis", MODE="0660", GROUP="dialout", ENV{ID_MM_DEVICE_IGNORE}="1"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="28e9", ATTRS{idProduct}=="018a", ATTRS{serial}=="55686CC014B0", SYMLINK+="laser_axis", MODE="0660", GROUP="dialout", ENV{ID_MM_DEVICE_IGNORE}="1"

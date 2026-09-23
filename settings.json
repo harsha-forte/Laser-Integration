@@ -1,17 +1,38 @@
 {
+  "homing_transfer": {
+    "speed_fast": 50,
+    "speed_slow": 10,
+    "timeout": 200
+  },
+  "homing_laser": {
+    "speed_fast": 50,
+    "speed_slow": 10,
+    "timeout": 200
+  },
+  "laser": {
+    "pulse_ms": 300
+  },
+  "reference_transfer": {
+    "established": true,
+    "abs_mode": true
+  },
+  "reference_laser": {
+    "established": true,
+    "abs_mode": true
+  },
+  "collision": {
+    "enabled": true,
+    "transfer_limit_mm": 200.0,
+    "laser_min_mm": 200.0
+  },
   "homing": {
     "speed_fast": 50,
     "speed_slow": 10,
     "timeout": 200,
     "offset_mm": -2.5
   },
-  "laser": {
-    "pulse_ms": 300
-  },
   "absolute_position": {
-    "reference_established": true
-  },
-  "appearance": {
-    "theme": "light"
+    "reference_established": true,
+    "reference_abs_mode": true
   }
 }

@@ -6,7 +6,7 @@ Open: http://192.168.17.132:5000
 
 from flask import Flask, jsonify, request, render_template_string
 from laser_ctrl import (
-    controller, State, MAX_TRAVEL_MM,
+    controller, AXES, AXIS_CONFIG, MAX_TRAVEL_MM,
     PART_HEIGHT_MIN_MM, PART_HEIGHT_MAX_MM,
 )
 import threading, atexit
@@ -105,11 +105,50 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',Arial,sans-se
 .confirm-copy{font-size:13px;line-height:1.6;color:var(--text);margin:8px 0 12px}.confirm-warning{padding:10px 12px;border:1px solid rgba(255,190,61,.35);background:rgba(255,190,61,.08);border-radius:8px;color:var(--warn);font-size:12px;line-height:1.5}
 @media(max-width:900px){body{overflow:auto}.topbar{grid-template-columns:1fr auto;height:auto;min-height:76px}.topnav{grid-column:1/-1;grid-row:2;margin:8px auto}.shell{min-height:800px}.control-layout{grid-template-columns:1fr}.status-tower{display:grid;grid-template-columns:1fr 1fr}.position-zone{border-left:1px solid var(--line)}.io-rack{display:block}.settings-grid{grid-template-columns:1fr}.auto-body{grid-template-columns:1fr}.jog-console{grid-template-columns:1fr}.jog-arrow{height:90px}.part-console,.program-bar{width:100%;min-width:0}.manual-workspace{grid-template-columns:1fr}.manual-left,.manual-right{justify-content:flex-start}.manual-right{display:grid;grid-template-columns:1fr 1fr}.manual-center{padding:8px 0}}
 @media(max-width:620px){.manual-right{grid-template-columns:1fr}}
+/* transfer axis: horizontal position bar */
+.travel-track.horiz{height:auto;display:flex;flex-direction:column;gap:7px;margin-top:12px}
+.travel-track.horiz .track{height:12px;border-left:none;border-bottom:1px solid var(--line);border-radius:4px;background:linear-gradient(to right,rgba(0,215,163,.12),transparent)}
+.travel-track.horiz .track:before,.travel-track.horiz .track:after{display:none}
+.travel-track.horiz .z-fill{top:4px;bottom:auto;left:0;height:4px;width:0%;background:linear-gradient(to right,var(--accent),var(--accent2));transition:width .25s}
+.travel-track.horiz .z-fill:after{top:-4px;left:auto;right:-6px}
+.travel-track.horiz .ruler{flex-direction:row;justify-content:space-between;text-align:left}
+.travel-track.horiz.home-right .track{background:linear-gradient(to left,rgba(0,215,163,.12),transparent)}
+.travel-track.horiz.home-right .z-fill{left:auto;right:0;background:linear-gradient(to left,var(--accent),var(--accent2))}
+.travel-track.horiz.home-right .z-fill:after{right:auto;left:-6px}
+/* laser axis: short vertical bar */
+.travel-track.vert{height:96px;margin-top:10px}
+.position-zone+.position-zone{border-top:1px solid var(--line)}
+.home-banner{display:none;margin-top:10px;font-size:11px;font-weight:700;line-height:1.45;color:var(--warn);border:1px solid var(--warn);border-radius:8px;padding:8px 10px;cursor:pointer}
+.home-banner.show{display:block}
+.disabled-note{margin:12px 0 0;font-size:12px;font-weight:700;color:var(--warn);border:1px solid var(--warn);border-radius:9px;padding:10px 12px}
+/* two-axis jog */
+.jog-axes{flex:1;display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:16px}
+.jog-card{background:var(--panel2);border:1px solid var(--line);border-radius:12px;padding:14px;display:flex;flex-direction:column;gap:12px}
+.jog-card.off .jog-pad{opacity:.45}
+.jog-card-head{display:flex;justify-content:space-between;align-items:center}
+.jog-card-title{font-size:14px;font-weight:800}
+.jog-card-sub{font:9px Consolas,monospace;color:var(--muted);margin-top:3px}
+.jog-readout{font:800 30px Consolas,monospace;letter-spacing:-.04em}.jog-readout small{font-size:12px;color:var(--muted)}
+.jog-note{font-size:10px;color:var(--muted);min-height:14px}.jog-note.warn{color:var(--warn)}.jog-note.err{color:var(--danger)}
+.jog-pad{display:grid;gap:10px;align-items:center}
+.jog-pad.horizontal{grid-template-columns:1fr 130px 1fr}
+.jog-pad.vertical{grid-template-columns:1fr;justify-items:center}
+.jog-pad .jog-arrow{height:92px;width:100%;font-size:40px}
+.jog-pad.vertical .jog-arrow{height:70px;width:170px}
+.jog-pad label{display:block;font:700 9px Consolas,monospace;color:var(--muted);letter-spacing:.1em;text-transform:uppercase;margin-bottom:6px;text-align:center}
+.jog-pad input{text-align:center;font:800 22px Consolas,monospace;padding:10px}
+.jog-pad.vertical .jog-dist-box{width:170px}
+@media(max-width:1180px){.jog-axes{grid-template-columns:1fr}}
+.jog-pad .jog-arrow{touch-action:none;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none}
+/* equal-height cards: pad fills the middle, STOP buttons sit on the same bottom line */
+.jog-card .jog-pad{flex:1;align-content:center}
+.jog-card>.btn-red{margin-top:auto}
+.jog-pad .jog-arrow.held{background:var(--accent2);color:#fff;border-color:var(--accent2);transform:none}
 </style>
 </head>
 <body>
 <header class="topbar">
-  <div class="brand"><div class="brand-symbol"></div><div><h1>Laser Cell Console</h1><p>Z-axis marking station / operator terminal</p></div></div>
+  <div class="brand"><div class="brand-symbol"></div><div><h1>Laser Cell Console</h1><p>Transfer + laser axis marking station / operator terminal</p></div></div>
   <nav class="topnav">
     <button class="nav-btn active" id="nav-control" onclick="switchPage('control',this)">Operate</button>
     <button class="nav-btn" id="nav-settings" onclick="switchPage('settings',this)">Configure</button>
@@ -129,15 +168,25 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',Arial,sans-se
           <div class="machine-state">
             <div class="panel-kicker">Controller state</div>
             <div class="big-state" id="ov-state">IDLE</div>
-            <span id="hb-conn" class="badge b-err">Drive: disconnected</span>
+            <span id="hb-conn-transfer" class="badge b-err">Transfer: --</span>
+            <span id="hb-conn-laser" class="badge b-err">Laser: --</span>
             <span id="hb-state" class="badge b-muted">IDLE</span>
+            <div class="home-banner" id="home-banner" onclick="switchPage('settings',document.getElementById('nav-settings'))"></div>
           </div>
           <div class="position-zone">
-            <div class="position-label">Absolute Z position</div>
-            <div class="position-number"><span id="ov-pos">--</span><small> mm</small></div>
-            <div class="travel-track">
-              <div class="ruler"><span>{{ max_travel }}</span><span>{{ max_travel/2 }}</span><span>0</span></div>
-              <div class="track"><div class="z-fill" id="z-fill"></div></div>
+            <div class="position-label">{{ t.name }} position</div>
+            <div class="position-number"><span id="ov-pos-transfer">--</span><small> mm</small></div>
+            <div class="travel-track horiz{% if t.home_side == 'right' %} home-right{% endif %}">
+              <div class="track"><div class="z-fill" id="fill-transfer"></div></div>
+              <div class="ruler">{% if t.home_side == 'right' %}<span>{{ t.max_travel_mm|int }}</span><span>{{ (t.max_travel_mm/2)|int }}</span><span>0 (home)</span>{% else %}<span>0 (home)</span><span>{{ (t.max_travel_mm/2)|int }}</span><span>{{ t.max_travel_mm|int }}</span>{% endif %}</div>
+            </div>
+          </div>
+          <div class="position-zone">
+            <div class="position-label">{{ l.name }} position</div>
+            <div class="position-number"><span id="ov-pos-laser">--</span><small> mm</small></div>
+            <div class="travel-track vert">
+              <div class="ruler"><span>{{ l.max_travel_mm|int }}</span><span>{{ (l.max_travel_mm/2)|int }}</span><span>0</span></div>
+              <div class="track"><div class="z-fill" id="fill-laser"></div></div>
             </div>
           </div>
           <div class="mini-stats">
@@ -164,10 +213,11 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',Arial,sans-se
               <div class="op-top">
                 <div>
                   <h2 class="op-title">Manual Laser Program</h2>
-                  <div class="op-copy">Select a valid part, start the laser program to position Z at Side 1, then start each part with the screen MARK button or GPIO22 foot pedal. OUT4 advances intermediate sides; OUT5 completes the part.</div>
+                  <div class="op-copy">Select a valid part, start the laser program to position the transfer axis at Side 1, then start each part with the screen MARK button or GPIO22 foot pedal. OUT4 advances intermediate sides; OUT5 completes the part.</div>
                 </div>
                 <span class="mode-chip" id="manual-mode-chip">not started</span>
               </div>
+              <div class="disabled-note prog-disabled-note">Manual program is disabled until the two-axis program logic is defined. Use Axis jog and Configure for now.</div>
 
               <div class="program-bar">
                 <button class="btn btn-green" id="btn-program-start" onclick="manualProgramStart()">LASER PROGRAM START</button>
@@ -197,12 +247,12 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',Arial,sans-se
                   <div class="toggle-box">
                     <div class="sequence-head"><span>Operator start</span><span id="pedal-state">LOCKED</span></div>
                     <div class="sequence-name">Screen MARK or foot pedal</div>
-                    <div class="sequence-copy">The pedal is accepted only while Z is at the Side 1 initial position. A pedal press does not re-pulse GPIO17.</div>
+                    <div class="sequence-copy">The pedal is accepted only while the transfer axis is at the Side 1 initial position. A pedal press does not re-pulse GPIO17.</div>
                   </div>
                   <div class="sequence-box">
                     <div class="sequence-head"><span>Current recipe</span><span id="manual-step">0 / 0</span></div>
                     <div class="sequence-name" id="manual-summary-title">Select a part</div>
-                    <div class="sequence-copy" id="manual-summary-copy">Every side requires a configured Z height.</div>
+                    <div class="sequence-copy" id="manual-summary-copy">Every side requires a configured axis position.</div>
                     <div class="progress-track"><span id="manual-progress"></span></div>
                   </div>
                 </div>
@@ -213,6 +263,7 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',Arial,sans-se
           <div id="sub-auto" class="subtab-pane">
             <div class="operation">
               <div class="op-top"><div><h2 class="op-title">Automatic Cycle</h2><div class="op-copy">Run repeated laser cycles with robot placement and pickup handshake placeholders.</div></div><span class="mode-chip">sequence mode</span></div>
+              <div class="disabled-note prog-disabled-note">Automatic cycle is disabled until the two-axis program logic is defined.</div>
               <div class="auto-body">
                 <div class="field-panel">
                   <div class="field-title">Production quantity</div>
@@ -226,7 +277,7 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',Arial,sans-se
                   <div class="field-title">Sequence path</div>
                   <div class="process-steps">
                     <div class="process-step"><i></i><span>01 / Robot places part</span></div>
-                    <div class="process-step"><i></i><span>02 / Z axis moves to recipe position</span></div>
+                    <div class="process-step"><i></i><span>02 / Transfer axis moves to recipe position</span></div>
                     <div class="process-step"><i></i><span>03 / Laser marking cycle</span></div>
                     <div class="process-step"><i></i><span>04 / Remaining recipe positions</span></div>
                     <div class="process-step"><i></i><span>05 / Robot picks finished part</span></div>
@@ -238,12 +289,35 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',Arial,sans-se
 
           <div id="sub-jog" class="subtab-pane">
             <div class="operation">
-              <div class="op-top"><div><h2 class="op-title">Z Axis Jog</h2><div class="op-copy">Move the vertical axis by a defined relative distance. Travel is limited by the controller to the configured machine range.</div></div><span class="mode-chip">service motion</span></div>
-              <div class="jog-body">
-                <div class="jog-console">
-                  <button class="jog-arrow" id="btn-jog-down" onclick="doJog('down')">&#9660;</button>
-                  <div class="jog-centre"><label>Jog distance / mm</label><input type="number" id="jog-dist" min="0.1" max="400" step="0.1" value="1"><button class="btn btn-red jog-stop" onclick="doStop()">STOP AXIS</button></div>
-                  <button class="jog-arrow" id="btn-jog-up" onclick="doJog('up')">&#9650;</button>
+              <div class="op-top"><div><h2 class="op-title">Axis Jog</h2><div class="op-copy">Switch an axis ON, then press and HOLD an arrow: the axis moves while held and stops when released, or after the entered maximum distance. Each axis must be homed first; travel is also limited by the machine range and the group collision rule.</div></div><span class="mode-chip">service motion</span></div>
+              <div class="jog-axes">
+                <div class="jog-card off" id="jogcard-transfer">
+                  <div class="jog-card-head">
+                    <div><div class="jog-card-title">{{ t.name }}</div><div class="jog-card-sub">left / right · 0-{{ t.max_travel_mm|int }} mm · {{ t.port }}</div></div>
+                    <label class="toggle"><input type="checkbox" id="jogen-transfer" onchange="setJogEnabled('transfer',this)"><span class="slider"></span></label>
+                  </div>
+                  <div class="jog-readout"><span id="jogpos-transfer">--</span><small> mm</small></div>
+                  <div class="jog-note" id="jognote-transfer">--</div>
+                  <div class="jog-pad horizontal">
+                    <button class="jog-arrow" id="jog-transfer-left" data-axis="transfer" data-dir="left" title="Hold to jog left">&#9664;</button>
+                    <div><label>Max distance / mm</label><input type="number" id="jogdist-transfer" min="0.1" max="{{ t.max_travel_mm }}" step="0.1" value="1"></div>
+                    <button class="jog-arrow" id="jog-transfer-right" data-axis="transfer" data-dir="right" title="Hold to jog right">&#9654;</button>
+                  </div>
+                  <button class="btn btn-red full" onclick="stopAxis('transfer')">STOP TRANSFER AXIS</button>
+                </div>
+                <div class="jog-card off" id="jogcard-laser">
+                  <div class="jog-card-head">
+                    <div><div class="jog-card-title">{{ l.name }}</div><div class="jog-card-sub">up / down · 0-{{ l.max_travel_mm|int }} mm · {{ l.port }}</div></div>
+                    <label class="toggle"><input type="checkbox" id="jogen-laser" onchange="setJogEnabled('laser',this)"><span class="slider"></span></label>
+                  </div>
+                  <div class="jog-readout"><span id="jogpos-laser">--</span><small> mm</small></div>
+                  <div class="jog-note" id="jognote-laser">--</div>
+                  <div class="jog-pad vertical">
+                    <button class="jog-arrow" id="jog-laser-up" data-axis="laser" data-dir="up" title="Hold to jog up">&#9650;</button>
+                    <div class="jog-dist-box"><label>Max distance / mm</label><input type="number" id="jogdist-laser" min="0.1" max="{{ l.max_travel_mm }}" step="0.1" value="1"></div>
+                    <button class="jog-arrow" id="jog-laser-down" data-axis="laser" data-dir="down" title="Hold to jog down">&#9660;</button>
+                  </div>
+                  <button class="btn btn-red full" onclick="stopAxis('laser')">STOP LASER AXIS</button>
                 </div>
               </div>
             </div>
@@ -262,9 +336,11 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',Arial,sans-se
             <div class="sig-row"><div><div class="sig-name">Remarking</div><div class="sig-sub">GPIO 27 -&gt; pin 8</div></div><span class="dot" id="sig-27"></span></div>
           </div>
           <div class="motor-grid">
-            <div class="motor-stat"><div class="motor-label">Position</div><div class="motor-value"><span id="m-pos">--</span><span class="motor-unit">mm</span></div></div>
-            <div class="motor-stat"><div class="motor-label">Speed</div><div class="motor-value"><span id="m-spd">--</span><span class="motor-unit">rpm</span></div></div>
-            <div class="motor-stat wide"><div class="motor-label">Motion state</div><div class="motor-value" id="m-state" style="font-size:13px">--</div></div>
+            <div class="motor-stat"><div class="motor-label">Transfer pos</div><div class="motor-value"><span id="m-pos-transfer">--</span><span class="motor-unit">mm</span></div></div>
+            <div class="motor-stat"><div class="motor-label">Transfer speed</div><div class="motor-value"><span id="m-spd-transfer">--</span><span class="motor-unit">rpm</span></div></div>
+            <div class="motor-stat"><div class="motor-label">Laser pos</div><div class="motor-value"><span id="m-pos-laser">--</span><span class="motor-unit">mm</span></div></div>
+            <div class="motor-stat"><div class="motor-label">Laser speed</div><div class="motor-value"><span id="m-spd-laser">--</span><span class="motor-unit">rpm</span></div></div>
+            <div class="motor-stat wide"><div class="motor-label">Controller state</div><div class="motor-value" id="m-state" style="font-size:13px">--</div></div>
           </div>
         </aside>
       </div>
@@ -276,16 +352,40 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',Arial,sans-se
         <div class="settings-grid">
           <div>
             <div class="settings-card">
-              <div class="settings-title">Z axis homing</div>
-              <div class="homing-status" id="homing-status"><span class="dot" id="home-dot"></span><span id="home-status-text">Unknown - home to verify</span></div>
+              <div class="settings-title">{{ t.name }} homing</div>
+              <div class="homing-status"><span class="dot" id="home-dot-transfer"></span><span id="home-text-transfer">--</span></div>
               <div class="form-grid">
-                <div><label>Fast search speed / rpm</label><input type="number" id="h-fast" min="5" max="200" step="5"></div>
-                <div><label>Slow approach / rpm</label><input type="number" id="h-slow" min="1" max="50" step="1"></div>
-                <div class="span2"><label>Homing timeout / seconds</label><input type="number" id="h-timeout" min="10" max="600" step="10"></div>
+                <div><label>Fast search speed / rpm</label><input type="number" id="h-fast-transfer" min="5" max="200" step="5"></div>
+                <div><label>Slow approach / rpm</label><input type="number" id="h-slow-transfer" min="1" max="50" step="1"></div>
+                <div class="span2"><label>Homing timeout / seconds</label><input type="number" id="h-timeout-transfer" min="10" max="600" step="10"></div>
               </div>
-              <div class="help">Offset is fixed at -2.5 mm. The axis moves to 0 mm after a successful homing sequence.</div>
-              <div class="btn2"><button class="btn btn-amber" id="btn-home" onclick="startHoming()">START HOMING</button><button class="btn btn-red" id="btn-hstop" onclick="stopHoming()">STOP HOMING</button></div>
-              <button class="btn btn-ghost full mt8" onclick="saveHomingSettings()">SAVE HOMING PARAMETERS</button>
+              <div class="help">Method 17: moves to the NL switch. Home is the switch release point (0 mm); the axis does not move further after homing.</div>
+              <div class="btn2"><button class="btn btn-amber" id="btn-home-transfer" onclick="startHoming('transfer')">START HOMING</button><button class="btn btn-red" id="btn-hstop-transfer" onclick="stopHoming('transfer')">STOP HOMING</button></div>
+              <button class="btn btn-ghost full mt8" onclick="saveHomingSettings('transfer')">SAVE HOMING PARAMETERS</button>
+            </div>
+            <div class="settings-card">
+              <div class="settings-title">{{ l.name }} homing</div>
+              <div class="homing-status"><span class="dot" id="home-dot-laser"></span><span id="home-text-laser">--</span></div>
+              <div class="form-grid">
+                <div><label>Fast search speed / rpm</label><input type="number" id="h-fast-laser" min="5" max="200" step="5"></div>
+                <div><label>Slow approach / rpm</label><input type="number" id="h-slow-laser" min="1" max="50" step="1"></div>
+                <div class="span2"><label>Homing timeout / seconds</label><input type="number" id="h-timeout-laser" min="10" max="600" step="10"></div>
+              </div>
+              <div class="help">Method 17: moves down to the NL switch, then moves 2.5 mm up to 0 mm.</div>
+              <div class="btn2"><button class="btn btn-amber" id="btn-home-laser" onclick="startHoming('laser')">START HOMING</button><button class="btn btn-red" id="btn-hstop-laser" onclick="stopHoming('laser')">STOP HOMING</button></div>
+              <button class="btn btn-ghost full mt8" onclick="saveHomingSettings('laser')">SAVE HOMING PARAMETERS</button>
+            </div>
+            <div class="settings-card">
+              <div class="settings-title">Group collision configuration</div>
+              <div class="toggle-row" style="margin-bottom:12px"><div><div class="toggle-label">Collision rule active</div><div class="toggle-copy">Applies to jog, homing, manual and automatic moves</div></div>
+                <label class="toggle"><input type="checkbox" id="col-enabled"><span class="slider"></span></label></div>
+              <div class="form-grid">
+                <div><label>Transfer axis limit / mm</label><input type="number" id="col-transfer" min="0" max="{{ t.max_travel_mm }}" step="0.1"></div>
+                <div><label>Laser axis minimum / mm</label><input type="number" id="col-laser" min="0" max="{{ l.max_travel_mm }}" step="0.1"></div>
+              </div>
+              <div class="help" id="col-help">While the transfer axis is above its limit, the laser axis may not be below its minimum. Moves that would break the rule are blocked; jog moves stop at the limit. Unhomed or disconnected axes are treated as being in the worst position, so home the transfer axis before the laser axis.</div>
+              <div class="homing-status" id="col-status"><span class="dot" id="col-dot"></span><span id="col-text">--</span></div>
+              <button class="btn btn-ghost full" onclick="saveCollision()">SAVE COLLISION PARAMETERS</button>
             </div>
             <div class="settings-card">
               <div class="settings-title">Laser trigger</div>
@@ -312,8 +412,8 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',Arial,sans-se
   <h2 id="modal-title">New part</h2>
   <label>Part name</label><input type="text" id="edit-name" placeholder="e.g. Part_A">
   <div style="margin-top:12px"><label>Number of sides to be lasered</label><input type="number" id="edit-sides" min="1" max="64" step="1" value="1" onchange="renderSideRows()" oninput="renderSideRows()"></div>
-  <div class="help">Required: every side must have a Z height. Different sides may use the same height.</div>
-  <table class="side-table"><thead><tr><th>Side</th><th>Required Z height / mm</th></tr></thead><tbody id="steps-wrap"></tbody></table>
+  <div class="help">Required: every side must have an axis position. Different sides may use the same position.</div>
+  <table class="side-table"><thead><tr><th>Side</th><th>Required axis position / mm</th></tr></thead><tbody id="steps-wrap"></tbody></table>
   <div class="modal-foot"><button class="btn btn-green" onclick="savePart()">SAVE PART</button><button class="btn btn-ghost" onclick="closeModal()">CANCEL</button></div>
 </div></div>
 
@@ -332,6 +432,7 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',Arial,sans-se
 
 <script>
 const MAX_TRAVEL = {{ max_travel }};
+const AXES_CFG = {{ axes_cfg|tojson }};
 const PART_HEIGHT_MIN = {{ part_height_min }};
 const PART_HEIGHT_MAX = {{ part_height_max }};
 let lastStatus=null;
@@ -436,20 +537,42 @@ const SC={
 
 function updateStatus(d){
   lastStatus=d;
-  const cb=document.getElementById('hb-conn');
-  cb.className='badge '+(d.connected?'b-ok':'b-err');
-  cb.textContent=d.connected?'Drive: connected':'Drive: disconnected';
+  const AX=d.axes||{};
+  for(const k of ['transfer','laser']){
+    const a=AX[k]; if(!a) continue;
+    const b=document.getElementById('hb-conn-'+k);
+    const label=k==='transfer'?'Transfer':'Laser';
+    let cls='b-err',txt=`${label}: not connected`;
+    if(a.connected){
+      if(a.busy==='homing'){cls='b-warn';txt=`${label}: homing...`;}
+      else if(a.homed){cls='b-ok';txt=`${label}: ready`;}
+      else {cls='b-warn';txt=`${label}: homing required`;}
+    }
+    b.className='badge '+cls; b.textContent=txt; b.title=a.error||a.port;
+  }
+  const banner=document.getElementById('home-banner');
+  const need=d.homing_suggested||[];
+  banner.classList.toggle('show',need.length>0);
+  banner.textContent=need.length?`Homing required: ${need.join(', ')} - open Configure to home.`:'';
   const sb=document.getElementById('hb-state');
   sb.textContent=d.state; sb.style.color=SC[d.state]||'var(--muted)';
 
-  document.getElementById('m-pos').textContent=d.z_position!==null?d.z_position.toFixed(2):'--';
-  document.getElementById('m-spd').textContent=d.speed_rpm!==null?d.speed_rpm:'--';
+  const fmt=v=>(v===null||v===undefined)?'--':Number(v).toFixed(2);
+  for(const k of ['transfer','laser']){
+    const a=AX[k]||{};
+    document.getElementById('m-pos-'+k).textContent=fmt(a.position);
+    document.getElementById('m-spd-'+k).textContent=(a.speed===null||a.speed===undefined)?'--':a.speed;
+    document.getElementById('ov-pos-'+k).textContent=fmt(a.position);
+    const f=document.getElementById('fill-'+k);
+    if(f){const pct=(a.position!==null&&a.position!==undefined)?Math.max(0,Math.min(100,(a.position/a.max_travel_mm)*100)):0;
+      if(k==='transfer') f.style.width=pct+'%'; else f.style.height=pct+'%';}
+    updateJogCard(k,a,d.collision);
+    updateHomingCard(k,a);
+  }
   document.getElementById('m-state').textContent=d.state||'--';
   document.getElementById('m-state').style.color=SC[d.state]||'var(--muted)';
 
   const ovs=document.getElementById('ov-state'); if(ovs){ovs.textContent=d.state||'--';ovs.style.color=SC[d.state]||'var(--text)';}
-  const ovp=document.getElementById('ov-pos'); if(ovp) ovp.textContent=d.z_position!==null?d.z_position.toFixed(2):'--';
-  const zf=document.getElementById('z-fill'); if(zf){const pct=d.z_position!==null?Math.max(0,Math.min(100,(d.z_position/MAX_TRAVEL)*100)):0;zf.style.height=pct+'%';}
   const ovpart=document.getElementById('ov-part'); if(ovpart) ovpart.textContent=d.part||document.getElementById('part-select').value||'No part selected';
 
   const side=d.manual_side_number||0,total=d.manual_total_sides||0;
@@ -466,10 +589,10 @@ function updateStatus(d){
     msg.className='program-message';
     if(d.manual_error){msg.textContent=d.manual_error;msg.classList.add('err');}
     else if(d.manual_stopped && d.manual_awaiting_result){msg.textContent='Program stopped while waiting for EzCad2. RESUME keeps waiting, or RESET can recover after you confirm EzCad2 has stopped.';msg.classList.add('warn');}
-    else if(d.manual_stopped){msg.textContent='Program stopped. Z holds position. RESUME continues from the stored current side.';msg.classList.add('warn');}
+    else if(d.manual_stopped){msg.textContent='Program stopped. Axis holds position. RESUME continues from the stored current side.';msg.classList.add('warn');}
     else if(d.manual_mark_enabled){msg.textContent='Ready for a new part. Press MARK or the GPIO22 foot pedal.';msg.classList.add('good');}
     else if(d.manual_awaiting_result){msg.textContent=`Side ${side}/${total} is active. Waiting for ${side<total?'OUT4 intermediate finish':'OUT5 part complete'}.`;msg.classList.add('warn');}
-    else if(d.manual_program_state==='INITIALIZING'||d.manual_program_state==='RETURNING_INITIAL'||d.manual_program_state==='MOVING_NEXT'||d.manual_program_state==='RESETTING'){msg.textContent='Z axis positioning in progress. Operator start is locked.';msg.classList.add('warn');}
+    else if(d.manual_program_state==='INITIALIZING'||d.manual_program_state==='RETURNING_INITIAL'||d.manual_program_state==='MOVING_NEXT'||d.manual_program_state==='RESETTING'){msg.textContent='Transfer axis positioning in progress. Operator start is locked.';msg.classList.add('warn');}
     else if(d.manual_program_started){msg.textContent='Laser Program started.';msg.classList.add('good');}
     else {msg.textContent='Select a valid part, then press LASER PROGRAM START.';}
   }
@@ -488,22 +611,56 @@ function updateStatus(d){
   if(stopBtn) stopBtn.disabled=!d.manual_program_started||d.manual_stopped;
   if(resumeBtn) resumeBtn.disabled=!d.manual_program_started||!d.manual_stopped;
   // During a missing-OUT4/OUT5 recovery, RESET is intentionally enabled
-  // only after STOP. This prevents Z motion while EzCad2 may still be active.
+  // only after STOP. This prevents axis motion while EzCad2 may still be active.
   if(resetBtn) resetBtn.disabled=!d.manual_program_started||(d.manual_awaiting_result&&!d.manual_stopped);
 
-  const homeDot=document.getElementById('home-dot'),homeTxt=document.getElementById('home-status-text');
-  if(d.state==='HOMING'){homeDot.className='dot hi';homeDot.style.background='var(--warn)';homeTxt.textContent='Homing in progress...';}
-  else if(d.position_ready){homeDot.className='dot hi';homeDot.style.background='var(--accent)';homeTxt.textContent=`Absolute position valid · ${d.z_position!==null?d.z_position.toFixed(2)+'mm':'--'}`;}
-  else if(d.encoder_position_available){homeDot.className='dot hi';homeDot.style.background='var(--warn)';homeTxt.textContent=`Encoder online, reference required · raw ${d.z_position_raw!==null?d.z_position_raw:'--'}`;}
-  else{homeDot.className='dot lo';homeTxt.textContent='Absolute position unavailable - check drive / home machine';}
+  updateCollisionStatus(d.collision);
+  // Manual / Auto programs disabled until the two-axis logic is defined
+  const progOn=!!d.programs_enabled;
+  document.querySelectorAll('.prog-disabled-note').forEach(n=>n.style.display=progOn?'none':'block');
+  if(!progOn){
+    [startBtn,stopBtn,resumeBtn,resetBtn,mark,document.getElementById('btn-auto-start'),document.getElementById('btn-pause')]
+      .forEach(b=>{if(b) b.disabled=true;});
+    if(msg){msg.className='program-message warn';msg.textContent='Programs are disabled in this version.';}
+  } else {
+    const bas=document.getElementById('btn-auto-start'); if(bas) bas.disabled=!d.position_ready||d.manual_program_started;
+  }
+}
 
-  const bh=document.getElementById('btn-home'),bhs=document.getElementById('btn-hstop');
-  if(bh) bh.disabled=d.manual_program_started||d.state==='HOMING';
-  if(bhs) bhs.disabled=d.state!=='HOMING';
-  const bas=document.getElementById('btn-auto-start'); if(bas) bas.disabled=!d.position_ready||d.manual_program_started;
-  const bju=document.getElementById('btn-jog-up'),bjd=document.getElementById('btn-jog-down');
-  if(bju) bju.disabled=!d.position_ready||d.manual_program_started;
-  if(bjd) bjd.disabled=!d.position_ready||d.manual_program_started;
+function updateHomingCard(k,a){
+  const dot=document.getElementById('home-dot-'+k),txt=document.getElementById('home-text-'+k);
+  const bh=document.getElementById('btn-home-'+k),bs=document.getElementById('btn-hstop-'+k);
+  if(!dot) return;
+  if(!a.connected){dot.className='dot lo';dot.style.background='';txt.textContent=a.error||'Drive not connected';}
+  else if(a.busy==='homing'){dot.className='dot hi';dot.style.background='var(--warn)';txt.textContent='Homing in progress...';}
+  else if(a.homed){dot.className='dot hi';dot.style.background='var(--accent)';txt.textContent=`Homed · position ${a.position!==null?Number(a.position).toFixed(2)+' mm':'--'}`;}
+  else{dot.className='dot hi';dot.style.background='var(--warn)';txt.textContent=a.error||'Homing required';}
+  bh.disabled=!a.connected||!!a.busy||(lastStatus&&lastStatus.manual_program_started);
+  bs.disabled=a.busy!=='homing';
+}
+
+function updateJogCard(k,a,col){
+  const card=document.getElementById('jogcard-'+k); if(!card) return;
+  const tog=document.getElementById('jogen-'+k);
+  if(document.activeElement!==tog) tog.checked=!!a.jog_enabled;
+  tog.disabled=!a.connected&&!a.jog_enabled;
+  document.getElementById('jogpos-'+k).textContent=(a.position===null||a.position===undefined)?'--':Number(a.position).toFixed(2);
+  const note=document.getElementById('jognote-'+k);
+  let n='',cls='jog-note';
+  if(!a.connected){n=a.error||'Drive not connected';cls+=' err';}
+  else if(!a.homed){n=a.busy==='homing'?'Homing in progress...':'Not homed - home in Configure before jogging';cls+=' warn';}
+  else if(!a.jog_enabled){n='Switch ON to unlock jog';}
+  else if(a.busy){n=a.busy==='jog'?'Moving...':`Busy (${a.busy})`;cls+=' warn';}
+  else{n='Ready to jog';
+    if(col&&col.enabled){
+      if(k==='laser'&&col.laser_restricted){n=`Collision rule: laser limited to ≥ ${col.laser_min_mm} mm`;cls+=' warn';}
+      if(k==='transfer'&&col.transfer_restricted){n=`Collision rule: transfer limited to ≤ ${col.transfer_limit_mm} mm`;cls+=' warn';}
+    }}
+  note.className=cls; note.textContent=n;
+  const canJog=a.connected&&a.homed&&a.jog_enabled&&!a.busy;
+  card.classList.toggle('off',!a.jog_enabled);
+  const btns=k==='transfer'?['left','right']:['up','down'];
+  btns.forEach(b=>{const el=document.getElementById(`jog-${k}-${b}`); if(el) el.disabled=!canJog;});
 }
 
 // ── Signals ───────────────────────────────────────────────────────────────
@@ -547,7 +704,7 @@ function onPartSelect(name){
   if(!name){
     document.getElementById('part-mini').textContent='No marking recipe selected';
     document.getElementById('manual-summary-title').textContent='Select a part';
-    document.getElementById('manual-summary-copy').textContent='Every side requires a configured Z height.';
+    document.getElementById('manual-summary-copy').textContent='Every side requires a configured axis position.';
     fetch('/api/manual/select',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({part:''})});
     return;
   }
@@ -556,7 +713,7 @@ function onPartSelect(name){
     const sides=Number(p.sides||0);
     const valid=sides>=1&&positions.length===sides&&positions.every(x=>x.mm!==undefined&&x.mm!==null&&x.mm!=='');
     if(!valid){
-      const err=`Part configuration incomplete: a side count and one height for every side are mandatory.`;
+      const err=`Part configuration incomplete: a side count and one position for every side are mandatory.`;
       document.getElementById('part-mini').textContent=err;
       document.getElementById('part-mini').classList.add('config-error');
       document.getElementById('manual-summary-title').textContent=p.name;
@@ -597,7 +754,7 @@ function deletePart(name){
   },{confirmText:'DELETE'});
 }
 
-// ── Part editor: mandatory side count + mandatory height for each side ─────
+// ── Part editor: mandatory side count + mandatory position for each side ─────
 function openEditor(name){
   document.getElementById('modal-title').textContent=name?`Edit - ${name}`:'New part';
   document.getElementById('edit-name').value=name||'';
@@ -622,7 +779,7 @@ function renderSideRows(existing=null){
   wrap.innerHTML='';
   for(let i=0;i<n;i++){
     const tr=document.createElement('tr');
-    tr.innerHTML=`<td>SIDE ${i+1}</td><td><input class="side-mm" type="number" min="${PART_HEIGHT_MIN}" max="${PART_HEIGHT_MAX}" step="0.1" value="${vals[i]??''}" placeholder="Required height, 60-400 mm"></td>`;
+    tr.innerHTML=`<td>SIDE ${i+1}</td><td><input class="side-mm" type="number" min="${PART_HEIGHT_MIN}" max="${PART_HEIGHT_MAX}" step="0.1" value="${vals[i]??''}" placeholder="Required position, ${PART_HEIGHT_MIN}-${PART_HEIGHT_MAX} mm"></td>`;
     wrap.appendChild(tr);
   }
 }
@@ -633,37 +790,74 @@ function savePart(){
   if(!name){showToast('Part name is required','err');return;}
   if(!Number.isInteger(sides)||sides<1){showToast('Number of sides is required','err');return;}
   const inputs=[...document.querySelectorAll('.side-mm')];
-  if(inputs.length!==sides){showToast('Configuration error: side count does not match height rows','err');return;}
+  if(inputs.length!==sides){showToast('Configuration error: side count does not match position rows','err');return;}
   const positions=[];
   for(let i=0;i<sides;i++){
     const raw=inputs[i].value.trim();
     if(raw===''){showToast(`Height for side ${i+1} is required`,'err');return;}
     const mm=parseFloat(raw);
-    if(!Number.isFinite(mm)||mm<PART_HEIGHT_MIN||mm>PART_HEIGHT_MAX){showToast(`Side ${i+1} height must be ${PART_HEIGHT_MIN}-${PART_HEIGHT_MAX} mm`,'err');return;}
+    if(!Number.isFinite(mm)||mm<PART_HEIGHT_MIN||mm>PART_HEIGHT_MAX){showToast(`Side ${i+1} position must be ${PART_HEIGHT_MIN}-${PART_HEIGHT_MAX} mm`,'err');return;}
     positions.push({mm,label:`Side ${i+1}`});
   }
   fetch('/api/parts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,sides,positions})})
     .then(r=>r.json()).then(d=>{if(d.ok){closeModal();loadParts();document.getElementById('part-select').value=name;onPartSelect(name);showToast('Part recipe saved','good');}else showToast(d.error||'Save failed','err');}).catch(()=>showToast('Save request failed','err'));
 }
 
-// ── Homing ────────────────────────────────────────────────────────────────
-function startHoming(){ fetch('/api/home/start',{method:'POST'}); }
-function stopHoming(){  fetch('/api/home/stop', {method:'POST'}); }
-function saveHomingSettings(){
-  fetch('/api/home/settings',{
-    method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({
-      speed_fast:parseInt(document.getElementById('h-fast').value),
-      speed_slow:parseInt(document.getElementById('h-slow').value),
-      timeout:   parseInt(document.getElementById('h-timeout').value),
-    })
-  }).then(r=>r.json()).then(d=>{if(d.ok)showToast('Homing settings saved','good');else showToast(d.error||'Save failed','err');}).catch(()=>showToast('Save request failed','err'));
+// ── Homing (per axis) ─────────────────────────────────────────────────────
+async function axisCall(url,body){
+  try{
+    const r=await fetchWithTimeout(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)},4000);
+    let d={}; try{d=await r.json();}catch(_e){}
+    if(!r.ok||!d.ok){showToast(d.error||'Command rejected','err');return false;}
+    poll(); return true;
+  }catch(e){showToast('Controller request failed','err');return false;}
 }
-fetch('/api/home/settings').then(r=>r.json()).then(d=>{
-  document.getElementById('h-fast').value   =d.speed_fast;
-  document.getElementById('h-slow').value   =d.speed_slow;
-  document.getElementById('h-timeout').value=d.timeout;
-});
+function startHoming(axis){ axisCall('/api/home/start',{axis}); }
+function stopHoming(axis){  axisCall('/api/home/stop',{axis}); }
+function saveHomingSettings(axis){
+  const v=id=>parseInt(document.getElementById(`${id}-${axis}`).value);
+  const body={axis,speed_fast:v('h-fast'),speed_slow:v('h-slow'),timeout:v('h-timeout')};
+  if([body.speed_fast,body.speed_slow,body.timeout].some(x=>!Number.isFinite(x)||x<=0)){showToast('Enter valid homing values','err');return;}
+  axisCall('/api/home/settings',body).then(ok=>{if(ok)showToast(`${AXES_CFG[axis].name} homing settings saved`,'good');});
+}
+for(const axis of ['transfer','laser']){
+  fetch(`/api/home/settings?axis=${axis}`).then(r=>r.json()).then(d=>{
+    document.getElementById(`h-fast-${axis}`).value   =d.speed_fast;
+    document.getElementById(`h-slow-${axis}`).value   =d.speed_slow;
+    document.getElementById(`h-timeout-${axis}`).value=d.timeout;
+  }).catch(()=>{});
+}
+
+// ── Group collision configuration ─────────────────────────────────────────
+function loadCollision(){
+  fetch('/api/settings/collision').then(r=>r.json()).then(c=>{
+    document.getElementById('col-enabled').checked=!!c.enabled;
+    document.getElementById('col-transfer').value=c.transfer_limit_mm;
+    document.getElementById('col-laser').value=c.laser_min_mm;
+  }).catch(()=>{});
+}
+function saveCollision(){
+  const body={
+    enabled:document.getElementById('col-enabled').checked,
+    transfer_limit_mm:parseFloat(document.getElementById('col-transfer').value),
+    laser_min_mm:parseFloat(document.getElementById('col-laser').value),
+  };
+  if(!Number.isFinite(body.transfer_limit_mm)||!Number.isFinite(body.laser_min_mm)){showToast('Enter both collision limits','err');return;}
+  axisCall('/api/settings/collision',body).then(ok=>{if(ok){showToast('Collision configuration saved','good');loadCollision();}});
+}
+loadCollision();
+function updateCollisionStatus(c){
+  const dot=document.getElementById('col-dot'),txt=document.getElementById('col-text'); if(!dot||!c) return;
+  if(!c.enabled){dot.className='dot lo';dot.style.background='';txt.textContent='Rule OFF - no collision protection';return;}
+  dot.className='dot hi';
+  if(c.laser_restricted||c.transfer_restricted){
+    dot.style.background='var(--warn)';
+    const parts=[];
+    if(c.laser_restricted) parts.push(`laser limited to ≥ ${c.laser_min_mm} mm`);
+    if(c.transfer_restricted) parts.push(`transfer limited to ≤ ${c.transfer_limit_mm} mm`);
+    txt.textContent='Active now: '+parts.join(', ');
+  } else {dot.style.background='var(--accent)';txt.textContent='Active - no restriction at current positions';}
+}
 
 // ── Laser settings ────────────────────────────────────────────────────────
 function saveLaserSettings(){
@@ -680,17 +874,54 @@ fetch('/api/settings/laser').then(r=>r.json()).then(d=>{
   document.getElementById('pulse-ms').value=d.pulse_ms||100;
 });
 
-// ── Jog ───────────────────────────────────────────────────────────────────
-function doJog(direction){
-  const dist=parseFloat(document.getElementById('jog-dist').value);
-  if(isNaN(dist)||dist<=0||dist>400){
-    showToast('Distance must be 0.1–400mm','err');return;
-  }
-  fetch('/api/jog',{
-    method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({direction, distance_mm:dist})
-  });
+// ── Jog (per axis) ────────────────────────────────────────────────────────
+function setJogEnabled(axis,el){
+  axisCall('/api/axis/enable',{axis,on:el.checked}).then(ok=>{if(!ok) el.checked=!el.checked;});
 }
+function stopAxis(axis){ axisCall('/api/axis/stop',{axis}); }
+// Hold-to-run jog: move while held, stop on release; heartbeat = dead-man
+const jogState={transfer:null,laser:null};
+function jogBody(o){return {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(o)};}
+function jogPress(axis,direction,ev){
+  ev.preventDefault();
+  if(jogState[axis]) return;
+  const btn=ev.currentTarget; if(btn.disabled) return;
+  const max=AXES_CFG[axis].max_travel_mm;
+  const dist=parseFloat(document.getElementById('jogdist-'+axis).value);
+  if(!Number.isFinite(dist)||dist<=0||dist>max){showToast(`Distance must be 0.1–${max} mm`,'err');return;}
+  try{btn.setPointerCapture(ev.pointerId);}catch(_e){}
+  const st={id:null,timer:null,released:false,btn};
+  jogState[axis]=st; btn.classList.add('held');
+  fetchWithTimeout('/api/jog',jogBody({axis,direction,distance_mm:dist}),3000)
+    .then(async r=>{let d={};try{d=await r.json();}catch(_e){} return {ok:r.ok&&d.ok,d};})
+    .then(({ok,d})=>{
+      if(jogState[axis]!==st) return;
+      if(!ok){showToast(d.error||'Jog rejected','err');jogEnd(axis);return;}
+      st.id=d.jog_id;
+      if(st.released){sendJogRelease(axis,st.id);jogEnd(axis);return;}
+      st.timer=setInterval(()=>{fetch('/api/jog/hold',jogBody({axis,id:st.id})).catch(()=>{});},150);
+    })
+    .catch(()=>{showToast('Jog request failed','err');jogEnd(axis);});
+}
+function jogRelease(axis){
+  const st=jogState[axis]; if(!st) return;
+  if(st.id===null){st.released=true;return;}      // start still in flight
+  sendJogRelease(axis,st.id); jogEnd(axis);
+}
+function sendJogRelease(axis,id){fetch('/api/jog/release',jogBody({axis,id})).catch(()=>{});}
+function jogEnd(axis){
+  const st=jogState[axis]; if(!st) return;
+  if(st.timer) clearInterval(st.timer);
+  st.btn.classList.remove('held'); jogState[axis]=null;
+}
+document.querySelectorAll('.jog-pad .jog-arrow[data-axis]').forEach(btn=>{
+  const axis=btn.dataset.axis,dir=btn.dataset.dir;
+  btn.addEventListener('pointerdown',e=>jogPress(axis,dir,e));
+  ['pointerup','pointercancel','lostpointercapture'].forEach(t=>btn.addEventListener(t,()=>jogRelease(axis)));
+  btn.addEventListener('contextmenu',e=>e.preventDefault());
+});
+window.addEventListener('blur',()=>{jogRelease('transfer');jogRelease('laser');});
+document.addEventListener('visibilitychange',()=>{if(document.hidden){jogRelease('transfer');jogRelease('laser');}});
 
 // ── Manual Laser Program ─────────────────────────────────────────────────
 async function manualCall(url,body={}){
@@ -724,7 +955,7 @@ function manualProgramReset(){
       'Recover Laser Program',
       'EzCad2 did not send the expected OUT4/OUT5 signal. Confirm that EzCad2 marking has stopped.',
       ()=>manualCall('/api/manual/reset',{confirm_abort:true}),
-      {confirmText:'RESET PROGRAM',warning:'RESET discards the pending laser result, clears the side count, and moves Z back to Side 1.'}
+      {confirmText:'RESET PROGRAM',warning:'RESET discards the pending laser result, clears the side count, and moves the transfer axis back to Side 1.'}
     );
     return;
   }
@@ -736,10 +967,7 @@ function startAuto(){
   const p=document.getElementById('part-select').value;
   if(!p){showToast('Select a part first','warn');return;}
   const n=parseInt(document.getElementById('cycle-count').value)||1;
-  fetch('/api/auto/start',{
-    method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({part:p,cycles:n})
-  });
+  axisCall('/api/auto/start',{part:p,cycles:n});
 }
 function pauseResume(){ fetch('/api/auto/pause',{method:'POST'}); }
 
@@ -769,6 +997,11 @@ def index():
         part_height_min=PART_HEIGHT_MIN_MM,
         part_height_max=PART_HEIGHT_MAX_MM,
         theme=theme,
+        t=AXIS_CONFIG["transfer"],
+        l=AXIS_CONFIG["laser"],
+        axes_cfg={k: {"name": AXIS_CONFIG[k]["name"],
+                      "max_travel_mm": AXIS_CONFIG[k]["max_travel_mm"],
+                      "home_side": AXIS_CONFIG[k]["home_side"]} for k in AXES},
     )
 
 @app.route("/api/status")
@@ -789,26 +1022,61 @@ def api_logs_clear():
         controller.log_lines.clear()
     return jsonify({"ok": True})
 
+def _axis_arg(data):
+    axis = (data or {}).get("axis", "transfer")
+    return axis if axis in AXES else None
+
 @app.route("/api/home/start", methods=["POST"])
 def api_home_start():
-    return jsonify({"ok": controller.start_homing()})
+    axis = _axis_arg(request.get_json(silent=True))
+    if not axis:
+        return jsonify({"ok": False, "error": "Unknown axis"}), 400
+    ok, err = controller.start_homing(axis)
+    return jsonify({"ok": ok, "error": err}), (200 if ok else 409)
 
 @app.route("/api/home/stop", methods=["POST"])
 def api_home_stop():
-    controller.stop_homing()
+    axis = _axis_arg(request.get_json(silent=True))
+    if not axis:
+        return jsonify({"ok": False, "error": "Unknown axis"}), 400
+    controller.stop_homing(axis)
     return jsonify({"ok": True})
 
 @app.route("/api/home/settings", methods=["GET"])
 def api_home_settings_get():
-    return jsonify(controller.settings.get_section("homing"))
+    axis = _axis_arg(request.args)
+    if not axis:
+        return jsonify({"error": "Unknown axis"}), 400
+    return jsonify(controller.settings.get_section(f"homing_{axis}"))
 
 @app.route("/api/home/settings", methods=["POST"])
 def api_home_settings_save():
-    data = request.get_json() or {}
-    controller.settings.update_section("homing",
-        {k: v for k, v in data.items()
-         if k in {"speed_fast", "speed_slow", "timeout"}})
+    data = request.get_json(silent=True) or {}
+    axis = _axis_arg(data)
+    if not axis:
+        return jsonify({"ok": False, "error": "Unknown axis"}), 400
+    vals = {}
+    limits = {"speed_fast": (5, 200), "speed_slow": (1, 50), "timeout": (10, 600)}
+    for k, (lo, hi) in limits.items():
+        if k in data:
+            try:
+                v = int(data[k])
+            except (TypeError, ValueError):
+                return jsonify({"ok": False, "error": f"{k} must be a number"}), 400
+            if not lo <= v <= hi:
+                return jsonify({"ok": False, "error": f"{k} must be {lo}-{hi}"}), 400
+            vals[k] = v
+    controller.settings.update_section(f"homing_{axis}", vals)
     return jsonify({"ok": True})
+
+@app.route("/api/axis/enable", methods=["POST"])
+def api_axis_enable():
+    data = request.get_json(silent=True) or {}
+    axis = _axis_arg(data)
+    if not axis:
+        return jsonify({"ok": False, "error": "Unknown axis"}), 400
+    ok, err = controller.set_jog_enabled(axis, bool(data.get("on")))
+    return jsonify({"ok": ok, "error": err}), (200 if ok else 409)
 
 @app.route("/api/settings/laser", methods=["GET"])
 def api_laser_settings_get():
@@ -838,17 +1106,61 @@ def api_mode():
     controller.set_mode(data.get("mode", "manual"))
     return jsonify({"ok": True})
 
+@app.route("/api/axis/stop", methods=["POST"])
+def api_axis_stop():
+    axis = _axis_arg(request.get_json(silent=True))
+    if not axis:
+        return jsonify({"ok": False, "error": "Unknown axis"}), 400
+    ok, err = controller.stop_axis(axis)
+    return jsonify({"ok": ok, "error": err}), (200 if ok else 409)
+
+@app.route("/api/settings/collision", methods=["GET"])
+def api_collision_get():
+    return jsonify(controller.settings.get_section("collision"))
+
+@app.route("/api/settings/collision", methods=["POST"])
+def api_collision_save():
+    data = request.get_json(silent=True) or {}
+    try:
+        t_lim = float(data.get("transfer_limit_mm"))
+        l_min = float(data.get("laser_min_mm"))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "Both limits must be numbers"}), 400
+    t_max = AXIS_CONFIG["transfer"]["max_travel_mm"]
+    l_max = AXIS_CONFIG["laser"]["max_travel_mm"]
+    if not 0 <= t_lim <= t_max:
+        return jsonify({"ok": False, "error": f"Transfer limit must be 0-{t_max:g} mm"}), 400
+    if not 0 <= l_min <= l_max:
+        return jsonify({"ok": False, "error": f"Laser minimum must be 0-{l_max:g} mm"}), 400
+    enabled = bool(data.get("enabled", True))
+    controller.settings.update_section("collision", {
+        "enabled": enabled, "transfer_limit_mm": t_lim, "laser_min_mm": l_min})
+    controller.log(f"Group collision rule {'ON' if enabled else 'OFF'}: transfer > {t_lim:g} mm "
+                   f"=> laser >= {l_min:g} mm")
+    return jsonify({"ok": True})
+
 @app.route("/api/jog", methods=["POST"])
 def api_jog():
-    data = request.get_json() or {}
-    direction = data.get("direction", "up")
-    distance = float(data.get("distance_mm", 1.0))
-    if not controller.position_ready():
-        controller.log("Jog request rejected - trusted absolute machine position unavailable")
-        return jsonify({"ok": False, "error": "Trusted absolute machine position unavailable"}), 409
-    if controller.manual_program_started:
-        return jsonify({"ok": False, "error": "Jog is locked while the manual Laser Program is started"}), 409
-    threading.Thread(target=controller.jog, args=(direction, distance), daemon=True).start()
+    """Start a hold-to-run jog; the browser then sends /api/jog/hold heartbeats."""
+    data = request.get_json(silent=True) or {}
+    axis = _axis_arg(data)
+    if not axis:
+        return jsonify({"ok": False, "error": "Unknown axis"}), 400
+    ok, err, jog_id = controller.jog(axis, data.get("direction", ""), data.get("distance_mm", 1.0))
+    return jsonify({"ok": ok, "error": err, "jog_id": jog_id}), (200 if ok else 409)
+
+@app.route("/api/jog/hold", methods=["POST"])
+def api_jog_hold():
+    data = request.get_json(silent=True) or {}
+    axis = _axis_arg(data)
+    return jsonify({"ok": bool(axis) and controller.jog_hold(axis, data.get("id"))})
+
+@app.route("/api/jog/release", methods=["POST"])
+def api_jog_release():
+    data = request.get_json(silent=True) or {}
+    axis = _axis_arg(data)
+    if axis:
+        controller.jog_release(axis, data.get("id"))
     return jsonify({"ok": True})
 
 @app.route("/api/manual/select", methods=["POST"])
@@ -891,7 +1203,7 @@ def api_auto_start():
     data = request.get_json() or {}
     ok = controller.start_auto(
         data.get("part", ""), int(data.get("cycles", 1)))
-    return jsonify({"ok": ok})
+    return jsonify({"ok": ok, "error": None if ok else "Automatic cycle is not available"}), (200 if ok else 409)
 
 @app.route("/api/auto/pause", methods=["POST"])
 def api_auto_pause():
